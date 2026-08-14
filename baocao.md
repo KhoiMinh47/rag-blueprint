@@ -87,17 +87,18 @@ Ngoài product workflow, source còn có:
 
 ### 3.2. Trạng thái tài liệu
 
-Các tài liệu trước đây có hai cách trình bày:
+Hai báo cáo trước đây có hai cách trình bày:
 
 - thongtinbaocao.md tập trung sâu vào ingest/OCR, đặc biệt Option 1 và
   Option 4.
 - fullbaocao.md tóm tắt bốn nhóm Qwen, Mistral, NVIDIA và experimental,
   đồng thời ghi benchmark.
 
-baocao.md này hợp nhất hai cách gọi và đối chiếu với selector/source hiện
-tại. Một số selector có tên legacy để không phá API/dashboard cũ; vì vậy tên
-selector không phải lúc nào cũng trùng hoàn toàn với tên model hoặc tên
-pipeline nội bộ.
+Baocao.md này đã hợp nhất toàn bộ phần ingest/OCR, kiến trúc model, workflow,
+benchmark và giới hạn của hai tài liệu đó, sau đó đối chiếu lại với
+selector/source/Compose hiện tại. Một số selector có tên legacy để không phá
+API/dashboard cũ; vì vậy tên selector không phải lúc nào cũng trùng hoàn toàn
+với tên model hoặc tên pipeline nội bộ.
 
 ### 3.3. Những gì không nằm trong repository
 
@@ -173,6 +174,64 @@ graph mới, override kwargs, in tree/summary, diff hai graph và serialize grap
 thành JSON. Đây là cơ chế hỗ trợ audit/reproducibility, không phải một model
 inference riêng.
 
+### 4.4. Workflow end-to-end của một job
+
+Một job ingest hoàn chỉnh đi qua các bước sau. Không phải mọi input đều chạy
+mọi bước; source chọn nhánh theo extension, extraction_mode và
+ocr_pipeline trong PipelineSpec.
+
+```text
+1. Submit job/document/page
+   → validate filename, extraction_mode, selector và endpoint
+
+2. Classify input
+   ├─ PDF/image          → document/page extraction
+   ├─ DOCX/PPTX          → LibreOffice → PDF → document extraction
+   ├─ TXT/MD/JSON/SH/HTML → text/HTML parser → splitter
+   ├─ XLSX/XLS/CSV       → native spreadsheet parser
+   └─ audio/video        → ASR hoặc frame/audio extraction
+
+3. Normalize document
+   → split page/chunk
+   → PDFium text + character bbox nếu là PDF native
+   → raster page image nếu là scan/image hoặc cần visual evidence
+
+4. Understand layout
+   → Page Elements semantic detections
+   → Table Structure cell/row/column geometry nếu bật
+   → tạo OCR units theo reading order và normalized bbox
+
+5. Recognize content
+   ├─ native text đủ tốt → giữ text, OCR bổ sung vùng thiếu
+   ├─ Nemotron baseline → OCR semantic regions + scan full-page/tile fallback
+   ├─ Option 2/3/5     → language route → VietOCR hoặc Nemotron fallback
+   ├─ Option 4          → Tesseract probe/recognition → Nemotron fallback
+   ├─ Option 6          → Qwen VLM crop/full-page
+   ├─ Option 7          → Ministral semantic crop/full-page fallback
+   └─ PP-OCR/PaddleOCR-VL → adapter/sidecar tương ứng
+
+6. Assemble candidates
+   → map local bbox về page bbox
+   → merge text/table/visual candidate
+   → quality gate, dedup, giữ backend/model/score/provenance
+
+7. Prepare retrieval
+   → clean → dedup → caption (nếu bật) → chunk
+   → embedding → LanceDB/store → webhook/status artifact
+
+8. Serve result
+   → query dense/hybrid/sparse
+   → optional rerank
+   → answer LLM hoặc dashboard visual evidence
+```
+
+Ở service mode, client thường tạo job trước rồi gửi document/page vào các
+route /v1/ingest/job/{job_id}/*. Gateway tổng hợp trạng thái từ worker; worker
+không được xem là đã hoàn tất chỉ vì OCR trả về text, vì embedding/store và
+callback vẫn còn là các phase riêng. Khi debug, nên kiểm tra theo thứ tự:
+pipeline-config → health của endpoint → job events/status → raw/sidecar
+result → LanceDB/query.
+
 ## 5. Định dạng đầu vào và routing
 
 ### 5.1. Định dạng được hỗ trợ
@@ -216,6 +275,23 @@ XLS/XLSX/CSV
 File .xls cần LibreOffice để convert sang .xlsx. Embedded image trong
 spreadsheet hiện chủ yếu được giữ ở metadata; chưa tự động trở thành một
 OCR job độc lập trong đường spreadsheet chính.
+
+### 5.4. Quyết định nhanh theo loại tài liệu
+
+| Tài liệu | Có OCR không? | Workflow nên dùng | Lưu ý chính |
+|---|---:|---|---|
+| PDF có text và bbox tốt | Chỉ bổ sung vùng thiếu | PDFium native → Page Elements → OCR chọn lọc → merge | Tiết kiệm request và giữ reading order |
+| PDF scan hoặc ảnh | Có | render → layout → semantic crop hoặc full-page/tile → OCR/VLM | Cần page image và scan fallback |
+| DOCX/PPTX | Sau khi convert | LibreOffice → PDF → workflow PDF | LibreOffice phải cài trên host/container |
+| XLSX/XLS/CSV | Không mặc định | parser workbook → rows/cells → chunk/embed | .xls cần convert; ảnh nhúng chưa tự OCR |
+| TXT/MD/JSON/SH/HTML | Không | parser → normalize → split/chunk/embed | OCR không mang lại lợi ích |
+| Audio/video | Không dùng OCR chữ là chính | ASR/frame extraction → clean/chunk/embed | Cần Parakeet hoặc media profile |
+
+Nếu mục tiêu là lấy nội dung tiếng Việt từ PDF scan, đường dễ kiểm soát nhất
+là bắt đầu bằng baseline Nemotron; sau đó thử Option 2/3/5/4 trên cùng corpus
+và giữ lại cả text, bbox, backend, score để so sánh. Nếu tài liệu nhiều bảng,
+bật Table Structure cho các route hỗ trợ; Qwen Option 6 có table crop/Markdown
+riêng và không cần tự động khởi động Table Structure sidecar.
 
 ## 6. Luồng ingest chi tiết
 
@@ -308,6 +384,62 @@ Một output row thường chứa các nhóm thông tin:
 | Evidence | page image, crop/image reference nếu được bật |
 | Retrieval | embedding, distance/score, VDB metadata |
 
+### 6.7. Workflow ingest chi tiết của baseline và nhánh fusion
+
+Hai báo cáo cũ mô tả baseline NVIDIA như “Option 1”. Trong source hiện tại,
+selector tương ứng là pipeline-nemotron-ocr; cách gọi Option 1 chỉ là cách
+gom để đối chiếu, không phải một selector mới.
+
+```text
+DocToPdfConversion (DOCX/PPTX nếu cần)
+  → PDFSplit
+  → PDFium
+  → Page Elements v3
+  → Table Structure v1 cho table
+  → xây text/title/table-cell/image units
+  → Nemotron OCR v2 cho vùng cần OCR
+  → scan full-page + overlapping tiles nếu không có native text đủ tốt
+  → merge native/OCR/table candidates
+  → dedup + clean_content_rows
+  → explode/chunk
+  → embedding
+```
+
+Trong nhánh PDF native, PDFium trả native characters kèm character bbox. Bộ
+điều phối dùng thông tin này để quyết định trang/vùng có cần OCR hay không;
+native text tốt được giữ để giảm latency, còn OCR chỉ bổ sung vùng thiếu, vùng
+ảnh hoặc vùng layout cần hiểu sâu hơn. Trong nhánh scan, page raster là nguồn
+ảnh chính; full-page fallback và các tile có overlap dùng để tăng recall khi
+Page Elements không tạo được vùng text hoàn chỉnh.
+
+Page Elements không chỉ là detector để vẽ box. Label text/title/table/chart/
+image/infographic quyết định loại unit và backend được gọi. Table Structure
+tiếp tục tách table thành cell/row/column; các cell có thể được OCR riêng,
+dựng pseudo-Markdown/Markdown, rồi giữ table_id, cell_id, row/column và bbox
+trong provenance. Khi block table-cell chồng lên text block, bước merge phải
+loại bản sao để nội dung không bị nhân đôi trong chunk.
+
+Nhánh Option 4 dùng cùng tư duy semantic-unit nhưng thay recognizer bằng
+đường fusion:
+
+```text
+Page Elements/Table Structure
+  → text/title/table-cell OCR units
+  → PP-OCRv6 medium line detector
+  → map line bbox về parent region và giữ parent left/right bounds
+  → Tesseract vie+eng probe
+  → Vietnamese đủ tin cậy → Tesseract vie, PSM 7
+  → English/mixed/uncertain hoặc Tesseract yếu → Nemotron OCR v2
+  → merge line/block candidates và giữ candidate bị loại trong debug metadata
+```
+
+Option 4 bỏ visual regions khỏi OCR units thông thường để tránh biến chart,
+image hoặc infographic thành line OCR request. Nếu line detector lỗi, source
+có horizontal-projection fallback; nếu Tesseract sidecar lỗi trên một page,
+Nemotron vẫn có thể nhận phần còn lại. Vì vậy output đúng không chỉ là một
+chuỗi text cuối cùng mà còn phải đọc `source`, `model`, `language_router`,
+`score`, `bbox` và `errors` trong row metadata khi cần audit.
+
 ## 7. Hệ thống pipeline và selector
 
 ### 7.1. Bảng quy đổi selector
@@ -367,6 +499,13 @@ Các service core:
 Đây là route có độ khớp cao nhất với kiến trúc NVIDIA hiện tại, hỗ trợ text,
 table, chart, image và infographic. Có thể dùng remote hosted endpoints hoặc
 NIM self-host.
+
+Đối với trang có native text, quyết định “có OCR hay không” dựa trên sự đầy
+đủ của text/geometry và các vùng semantic cần bổ sung; không nên hiểu rằng
+mọi trang PDF đều bị rasterize và OCR lại. Đối với scan, baseline ưu tiên
+recall: ngoài semantic crop còn có full-page và overlapping-tile fallback.
+Các block OCR được map về page coordinates rồi hợp nhất với native blocks,
+thay vì trả riêng nhiều bản sao của cùng một dòng.
 
 ### 8.2. Option 2 — Nemotron language-routed Vietnamese OCR
 
@@ -445,6 +584,15 @@ Option 4 có thể giữ dấu tiếng Việt tốt hơn trên crop phù hợp n
 và thêm network/request. Nó không phải pipeline xử lý visual đầy đủ; visual
 region chủ yếu được loại khỏi OCR unit thông thường.
 
+Runtime hiện đặt các ngưỡng chính ở language probe khoảng 0.70 và Tesseract
+quality khoảng 0.80. Probe bilingual chỉ quyết định backend; nó không phải
+ground-truth language classifier. Probe rỗng, crop quá ngắn, score thấp,
+Tesseract lỗi hoặc kết quả không usable đều đi Nemotron. PP-OCRv6 detector chỉ
+quyết định line geometry; source giữ horizontal bounds của parent region để
+tránh cắt mất ký tự đầu/cuối. Bởi vậy Option 4 có thể chậm hơn baseline do
+detector, CPU Tesseract, crop/map và fallback network, dù một số crop tiếng
+Việt có thể được nhận dạng tốt hơn.
+
 ### 8.5. Option 5 — detector + Vietnamese routing
 
 ```text
@@ -480,6 +628,15 @@ Các preset model:
 | option6-qwen-fp8.env | surogate/Qwen3.5-2B-FP8 |
 | option6-qwen-bf16.env | Qwen/Qwen3.5-2B |
 
+Các tuning được ghi trong preset/runtime của Qwen gồm extract workers/batch,
+detector/crop batch, streaming block/queue, Qwen admission batch, maximum
+sequence length, maximum batched tokens và GPU memory utilization. Một preset
+NVFP4 development từng được đo với extract batch 16, 4 workers, crop/detect
+batch khoảng 128, streaming block 16/queue 2, Qwen batch 8, tối đa 8 request
+đồng thời, max length khoảng 32K, max batched tokens 4096 và GPU utilization
+khoảng 0.20. Đây là tuning benchmark của máy đo, không phải mặc định SLA;
+đổi GPU/model cache có thể yêu cầu giảm batch hoặc sequence length.
+
 Qwen sidecar dùng qwen35-vllm.compose.yaml, image GPU local
 nemo-retriever-service-gpu:dev, model cache Hugging Face và vLLM runtime
 cache. Preset NVFP4 hiện giới hạn model length, sequence, batched tokens và
@@ -499,6 +656,12 @@ Model chạy trong sidecar ministral-fp8, publish host port 8016, dùng image
 GPU và Hugging Face cache. Route này phù hợp để so sánh VLM crop với Qwen,
 nhưng cần VRAM lớn hơn và không nên chạy đồng thời nhiều VLM nặng trên một GPU
 nhỏ.
+
+Preset Mistral được ghi nhận với max sequence length khoảng 8192, tối đa
+khoảng 10 sequence, max batched tokens 4096, GPU utilization khoảng 0.33,
+batch/worker khoảng 10 và max output khoảng 1024. Các con số này chỉ mô tả
+development configuration được dùng trong báo cáo trước; hãy lấy giá trị
+thực tế từ Compose/preset đang chạy.
 
 ### 8.8. Official PP-OCRv6
 
@@ -906,6 +1069,28 @@ docker compose \
   config --quiet
 ```
 
+### 15.5. Các case cần kiểm tra khi so sánh pipeline
+
+Khi chạy lại benchmark, không nên chỉ đo một PDF scan đơn giản. Bộ kiểm tra
+thực tế nên tách ít nhất các case sau:
+
+| Case | Điều cần quan sát |
+|---|---|
+| Scan nhiều trang | page order, full-page/tile recall, first request và throughput |
+| PDF native | native text có được giữ không, có OCR trùng không, bbox có đúng không |
+| Bảng nhiều hàng/cột | Table Structure, cell_id/row/column, Markdown và dedup |
+| Tiêu ngữ/header/footer | Page Elements label, reading order và khả năng bị lặp |
+| Dấu mộc/chữ ký | có bị xem thành text/image/visual hay bị bỏ qua; không giả định có stamp OCR riêng |
+| Chart/infographic/image | visual evidence, caption hoặc OCR có được route đúng không |
+| Tiếng Việt có dấu | language route, VietOCR/Tesseract quality gate, fallback Nemotron |
+| Spreadsheet có ảnh nhúng | native cell output và việc ảnh có/không được tách thành OCR job |
+
+Các báo cáo cũ ghi nhận chủ yếu bằng quan sát development trên những case này;
+chưa có corpus công khai cố định, ground truth đầy đủ hoặc metric tách theo
+layout/table/character error. Vì vậy số request, latency, VRAM và similarity
+chỉ có ý nghĩa khi giữ nguyên model tag, image tag, GPU, cache state, batch,
+concurrency và input corpus.
+
 ## 16. Giới hạn, rủi ro và các điểm cần chú ý
 
 ### 16.1. Accuracy
@@ -1046,8 +1231,10 @@ Kết luận tổng thể:
 - nemo_retriever/harness/README.md: benchmark command/artifact contract.
 - nemo_retriever/helm/README.md: Kubernetes/Helm deployment.
 - nemo_retriever/developer_docs/graph_pipeline_registry.md: graph registry.
-- thongtinbaocao.md: báo cáo ingest/OCR chi tiết trước đây.
-- fullbaocao.md: báo cáo benchmark/tổng hợp trước đây.
+- Nội dung thongtinbaocao.md trước khi hợp nhất: ingest/OCR chi tiết, Option 1
+  và Option 4.
+- Nội dung fullbaocao.md trước khi hợp nhất: benchmark và bốn nhóm Qwen,
+  Ministral, NVIDIA, experimental.
 
 Báo cáo này mô tả trạng thái source tại ngày tổng hợp. Model version, image
 tag, dependency, GPU behavior và benchmark có thể thay đổi theo preset hoặc

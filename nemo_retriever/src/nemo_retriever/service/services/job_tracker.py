@@ -147,6 +147,8 @@ class DocumentRecord(RichModel):
     error: str | None = None
     filename: str | None = None
     """Original upload filename, surfaced in the dashboard UI."""
+    pipeline_diagnostics: dict[str, Any] | None = None
+    """Compact pipeline metrics; independent of retained result rows."""
 
 
 class JobAggregate(RichModel):
@@ -363,6 +365,32 @@ class JobTracker:
             self._evict_locked()
             return [rec.model_copy(deep=True) for rec in self._documents.values()]
 
+    def delete_job(self, job_id: str) -> list[str] | None:
+        """Remove one job aggregate and all of its document records.
+
+        Returns the document ids whose retained result payloads must be
+        cleaned by the caller, or ``None`` when the job does not exist.
+        Queued work already handed to a worker is not cancelled here; its
+        later completion is ignored because the tracker record is gone.
+        """
+        with self._lock:
+            agg = self._get_live_job_locked(job_id)
+            if agg is None:
+                return None
+            document_ids = list(agg.document_ids)
+            self._drop_job_locked(job_id)
+        if self._event_bus is not None:
+            self._event_bus.publish_sync(
+                {
+                    "type": "job_deleted",
+                    "job_id": job_id,
+                    "document_ids": document_ids,
+                },
+                job_id=job_id,
+            )
+        logger.info("Job deleted: %s (documents=%d)", job_id, len(document_ids))
+        return document_ids
+
     # ── document lifecycle ───────────────────────────────────────────
 
     def register_document(
@@ -463,6 +491,7 @@ class JobTracker:
         result_rows: int = 0,
         result_data: list[dict[str, Any]] | None = None,
         elapsed_s: float | None = None,
+        pipeline_diagnostics: dict[str, Any] | None = None,
     ) -> MarkOutcome:
         """Transition a document to ``completed``; maybe finalize the job.
 
@@ -477,6 +506,7 @@ class JobTracker:
             result_rows=result_rows,
             result_data=result_data,
             elapsed_s=elapsed_s,
+            pipeline_diagnostics=pipeline_diagnostics,
         )
 
     def mark_failed(
@@ -485,6 +515,7 @@ class JobTracker:
         error: str,
         *,
         elapsed_s: float | None = None,
+        pipeline_diagnostics: dict[str, Any] | None = None,
     ) -> MarkOutcome:
         """Transition a document to ``failed``; maybe finalize the job.
 
@@ -495,6 +526,7 @@ class JobTracker:
             new_status=DocumentStatus.FAILED,
             error=error,
             elapsed_s=elapsed_s,
+            pipeline_diagnostics=pipeline_diagnostics,
         )
 
     def _mark_terminal(
@@ -506,6 +538,7 @@ class JobTracker:
         result_data: list[dict[str, Any]] | None = None,
         error: str | None = None,
         elapsed_s: float | None = None,
+        pipeline_diagnostics: dict[str, Any] | None = None,
     ) -> MarkOutcome:
         # Phase 1: under lock, mutate state and gather snapshots.
         with self._lock:
@@ -537,6 +570,11 @@ class JobTracker:
             retain_results = bool(agg_for_retain.retain_results) if agg_for_retain is not None else False
             rec.result_data = copy.deepcopy(result_data) if retain_results else None
             rec.error = error
+            rec.pipeline_diagnostics = (
+                copy.deepcopy(pipeline_diagnostics)
+                if isinstance(pipeline_diagnostics, dict)
+                else None
+            )
             if elapsed_s is not None:
                 rec.elapsed_s = elapsed_s
             else:
@@ -714,6 +752,7 @@ class JobTracker:
             "elapsed_s": rec.elapsed_s,
             "error": rec.error,
             "filename": rec.filename,
+            "pipeline_diagnostics": copy.deepcopy(rec.pipeline_diagnostics),
         }
         self._event_bus.publish_sync(event, job_id=rec.job_id)
 

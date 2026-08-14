@@ -50,8 +50,6 @@ def build_warmup_spec(
 
     if not str(extract.get("page_elements_invoke_url") or "").strip():
         stages.append("page_elements")
-    if not str(extract.get("ocr_invoke_url") or "").strip():
-        stages.append("ocr")
     if extract.get("use_table_structure") and not str(extract.get("table_structure_invoke_url") or "").strip():
         stages.append("table_structure")
 
@@ -89,7 +87,6 @@ def build_warmup_spec(
 
     spec: dict[str, Any] = {
         "stages": stages,
-        "ocr_version": extract.get("ocr_version", "v2"),
         "ocr_lang": extract.get("ocr_lang"),
     }
     if embed_spec is not None:
@@ -117,18 +114,6 @@ def warm_local_models(spec: dict[str, Any]) -> None:
 
         logger.info("Warming local model: page_elements")
         _REGISTRY["page_elements"] = NemotronPageElementsV3()
-
-    ocr_needed = "ocr" in stages or "table_structure" in stages
-    if ocr_needed and "ocr" not in _REGISTRY:
-        from nemo_retriever.common.modality.ocr.config import resolve_ocr_v2_lang
-        from nemo_retriever.models.local import NemotronOCRV2
-
-        lang = resolve_ocr_v2_lang(
-            str(spec.get("ocr_version", "v2")),
-            spec.get("ocr_lang"),
-        )
-        logger.info("Warming local model: ocr (lang=%s)", lang)
-        _REGISTRY["ocr"] = NemotronOCRV2(lang=lang)
 
     if "table_structure" in stages:
         from nemo_retriever.models.local import NemotronTableStructureV1

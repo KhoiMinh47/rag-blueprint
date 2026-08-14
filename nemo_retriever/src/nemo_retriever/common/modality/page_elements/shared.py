@@ -38,6 +38,12 @@ except Exception:  # pragma: no cover
 
 TensorOrArray = Union["torch.Tensor", "np.ndarray"]
 
+_SCAN_TILE_SIZE = 1024
+_SCAN_TILE_OVERLAP = 0.15
+_SCAN_TILE_MIN_VISUAL_SCORE = 0.50
+_ENABLE_SCAN_PAGE_ELEMENT_TILES = False
+_VISUAL_LABELS = frozenset({"table", "chart", "image", "infographic", "stamp"})
+
 
 def _ensure_chw_float_tensor(x: TensorOrArray) -> "torch.Tensor":
     """
@@ -91,6 +97,131 @@ def _error_payload(*, stage: str, exc: BaseException) -> Dict[str, Any]:
             "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
         },
     }
+
+
+def _scan_tile_starts(length: int, tile_size: int, overlap: float) -> List[int]:
+    """Return monotonic tile origins that cover an axis without gaps."""
+    if length <= tile_size:
+        return [0]
+    stride = max(1, int(tile_size * (1.0 - overlap)))
+    starts = list(range(0, max(1, length - tile_size + 1), stride))
+    last = length - tile_size
+    if starts[-1] != last:
+        starts.append(last)
+    return sorted(set(starts))
+
+
+def _scan_tiles_from_b64(
+    image_b64: str,
+    *,
+    tile_size: int = _SCAN_TILE_SIZE,
+    overlap: float = _SCAN_TILE_OVERLAP,
+) -> List[Tuple[List[float], str]]:
+    """Create overlapping model-sized crops and page-normalized tile boxes.
+
+    The full page remains the first inference request. Tiles are only an
+    additional high-resolution pass for scan pages, where small seals,
+    illustrations, and dense text can disappear during the model resize.
+    """
+    if Image is None:
+        return []
+    try:
+        raw = base64.b64decode(image_b64)
+        with Image.open(io.BytesIO(raw)) as source:
+            image = source.convert("RGB")
+            width, height = image.size
+            if width <= tile_size and height <= tile_size:
+                return []
+            x_starts = _scan_tile_starts(width, tile_size, overlap)
+            y_starts = _scan_tile_starts(height, tile_size, overlap)
+            result: List[Tuple[List[float], str]] = []
+            for top in y_starts:
+                for left in x_starts:
+                    right = min(width, left + tile_size)
+                    bottom = min(height, top + tile_size)
+                    crop = image.crop((left, top, right, bottom))
+                    buf = io.BytesIO()
+                    crop.save(buf, format="PNG", compress_level=3)
+                    result.append(
+                        (
+                            [
+                                left / width,
+                                top / height,
+                                right / width,
+                                bottom / height,
+                            ],
+                            base64.b64encode(buf.getvalue()).decode("ascii"),
+                        )
+                    )
+            return result
+    except Exception:
+        return []
+
+
+def _map_detection_bbox_to_page(detection: Dict[str, Any], tile_bbox: Sequence[float]) -> Dict[str, Any]:
+    """Map one tile-local detector bbox to normalized full-page coordinates."""
+    local = detection.get("bbox_xyxy_norm")
+    if not isinstance(local, (list, tuple)) or len(local) != 4:
+        return detection
+    x0, y0, x1, y1 = [float(value) for value in tile_bbox[:4]]
+    lx0, ly0, lx1, ly1 = [float(value) for value in local]
+    mapped = [
+        x0 + lx0 * (x1 - x0),
+        y0 + ly0 * (y1 - y0),
+        x0 + lx1 * (x1 - x0),
+        y0 + ly1 * (y1 - y0),
+    ]
+    return {**detection, "bbox_xyxy_norm": mapped}
+
+
+def _bbox_iou(left: Sequence[float], right: Sequence[float]) -> float:
+    if len(left) != 4 or len(right) != 4:
+        return 0.0
+    lx0, ly0, lx1, ly1 = [float(value) for value in left]
+    rx0, ry0, rx1, ry1 = [float(value) for value in right]
+    ix0, iy0 = max(lx0, rx0), max(ly0, ry0)
+    ix1, iy1 = min(lx1, rx1), min(ly1, ry1)
+    intersection = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    left_area = max(0.0, lx1 - lx0) * max(0.0, ly1 - ly0)
+    right_area = max(0.0, rx1 - rx0) * max(0.0, ry1 - ry0)
+    union = left_area + right_area - intersection
+    return intersection / union if union > 0.0 else 0.0
+
+
+def _merge_scan_visual_detections(
+    full_page_detections: List[Dict[str, Any]],
+    tile_detections: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Add only conservative visual candidates from tiles.
+
+    Page Elements v3 has page-level expansion rules. Applying those rules to
+    overlapping tile outputs can turn a small false positive into a nearly
+    full-page box, so full-page output owns normal postprocessing. Tiles only
+    contribute small visual candidates that do not overlap a same-class
+    full-page detection.
+    """
+    merged = list(full_page_detections)
+    for candidate in tile_detections:
+        label = str(candidate.get("label_name") or "")
+        bbox = candidate.get("bbox_xyxy_norm")
+        if label not in {"table", "chart", "infographic"} or not isinstance(bbox, list):
+            continue
+        area = max(0.0, float(bbox[2]) - float(bbox[0])) * max(0.0, float(bbox[3]) - float(bbox[1]))
+        score = float(candidate.get("score") or 0.0)
+        if score < _SCAN_TILE_MIN_VISUAL_SCORE:
+            continue
+        # Large low-confidence tile boxes are usually page-context artifacts;
+        # they are not allowed to override the full-page result.
+        if area > 0.35 and score < 0.70:
+            continue
+        if any(
+            str(existing.get("label_name") or "") == label
+            and _bbox_iou(existing.get("bbox_xyxy_norm") or [], bbox) >= 0.50
+            for existing in merged
+        ):
+            continue
+        merged.append(candidate)
+    return merged
 
 
 def _decode_b64_image_to_chw_tensor(image_b64: str) -> Tuple["torch.Tensor", Tuple[int, int]]:
@@ -364,15 +495,81 @@ def _apply_page_elements_v3_postprocess(
 
     Returns the original detections unchanged if the API function is unavailable.
     """
-    if postprocess_page_elements_v3 is None or not dets:
+    if not dets:
         return dets
+
+    original_dets = [dict(detection) for detection in dets if isinstance(detection, dict)]
+
+    def _small_crop_padding(bbox: Sequence[float], padding: float = 0.01) -> List[float]:
+        values = [float(value) for value in bbox[:4]]
+        return [
+            max(0.0, values[0] - padding),
+            max(0.0, values[1] - padding),
+            min(1.0, values[2] + padding),
+            min(1.0, values[3] + padding),
+        ]
+
+    def _match_original(processed: Dict[str, Any], used: set[int]) -> Optional[tuple[int, Dict[str, Any]]]:
+        label = str(processed.get("label_name") or "")
+        candidates = [
+            (index, original)
+            for index, original in enumerate(original_dets)
+            if index not in used and str(original.get("label_name") or "") == label
+        ]
+        if not candidates:
+            return None
+        processed_score = processed.get("score")
+
+        def rank(item: tuple[int, Dict[str, Any]]) -> tuple[float, float]:
+            _index, original = item
+            try:
+                score_delta = abs(float(original.get("score")) - float(processed_score))
+            except (TypeError, ValueError):
+                score_delta = 1.0
+            return (score_delta, -_bbox_iou(processed.get("bbox_xyxy_norm") or [], original.get("bbox_xyxy_norm") or []))
+
+        return min(candidates, key=rank)
+
+    def _preserve_model_geometry(processed_dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep model geometry separate from layout postprocessing geometry.
+
+        Page Elements v3 intentionally expands chart/table boxes for layout
+        matching. That geometry is useful for layout reasoning, but it is too
+        broad for a visual crop or native-text ownership test. Visual blocks
+        therefore expose the raw model box as ``bbox_xyxy_norm`` and keep the
+        expanded box in ``processed_bbox_xyxy_norm``.
+        """
+        used: set[int] = set()
+        for processed in processed_dets:
+            if not isinstance(processed, dict):
+                continue
+            matched = _match_original(processed, used)
+            if matched is None:
+                continue
+            original_index, original = matched
+            used.add(original_index)
+            model_bbox = original.get("bbox_xyxy_norm")
+            processed_bbox = processed.get("bbox_xyxy_norm")
+            if not isinstance(model_bbox, (list, tuple)) or len(model_bbox) != 4:
+                continue
+            model_bbox = [float(value) for value in model_bbox]
+            processed["model_bbox_xyxy_norm"] = model_bbox
+            if isinstance(processed_bbox, (list, tuple)) and len(processed_bbox) == 4:
+                processed["processed_bbox_xyxy_norm"] = [float(value) for value in processed_bbox]
+            if str(processed.get("label_name") or "") in _VISUAL_LABELS:
+                processed["bbox_xyxy_norm"] = model_bbox
+                processed["crop_bbox_xyxy_norm"] = _small_crop_padding(model_bbox)
+        return processed_dets
+
+    if postprocess_page_elements_v3 is None:
+        return _preserve_model_geometry(dets)
     try:
         ann_dict = _detections_to_annotation_dict(dets)
         labels = YOLOX_PAGE_V3_CLASS_LABELS if YOLOX_PAGE_V3_CLASS_LABELS is not None else list(ann_dict.keys())
         result = postprocess_page_elements_v3(ann_dict, labels=labels)
-        return _annotation_dict_to_detections(result)
+        return _preserve_model_geometry(_annotation_dict_to_detections(result))
     except Exception:
-        return dets
+        return _preserve_model_geometry(dets)
 
 
 def _remote_response_to_detections(
@@ -380,6 +577,7 @@ def _remote_response_to_detections(
     response_json: Dict[str, Any],
     label_names: List[str],
     thresholds_per_class: Sequence[float],
+    apply_v3_postprocess: bool = True,
 ) -> List[Dict[str, Any]]:
     # Try direct model-pred style payload first (or common wrappers around it).
     candidates: List[Any] = [response_json]
@@ -405,7 +603,7 @@ def _remote_response_to_detections(
                 batch_size=1,
                 label_names=label_names,
             )[0]
-            return _apply_page_elements_v3_postprocess(dets)
+            return _apply_page_elements_v3_postprocess(dets) if apply_v3_postprocess else dets
         except Exception:
             pass
 
@@ -418,7 +616,7 @@ def _remote_response_to_detections(
         if isinstance(bb, dict):
             try:
                 dets = _bounding_boxes_to_detections(bb)
-                return _apply_page_elements_v3_postprocess(dets)
+                return _apply_page_elements_v3_postprocess(dets) if apply_v3_postprocess else dets
             except Exception:
                 pass
 
@@ -430,7 +628,7 @@ def _remote_response_to_detections(
         if all(isinstance(v, list) for v in cand.values()):
             try:
                 dets = _annotation_dict_to_detections(cand)  # type: ignore[arg-type]
-                return _apply_page_elements_v3_postprocess(dets)
+                return _apply_page_elements_v3_postprocess(dets) if apply_v3_postprocess else dets
             except Exception:
                 pass
 
@@ -507,6 +705,7 @@ def detect_page_elements_v3(
     row_tensors: List[Optional[TensorOrArray]] = []
     row_shapes: List[Optional[Tuple[int, int]]] = []
     row_b64: List[Optional[str]] = []
+    row_scan_b64: List[Optional[str]] = []
     row_payloads: List[Dict[str, Any]] = []
 
     label_names = _labels_from_model(model) if model is not None else list(_RETRIEVER_LABEL_NAMES)
@@ -521,10 +720,18 @@ def detect_page_elements_v3(
 
     for _, row in pages_df.iterrows():
         try:
-            b64 = row.get("page_image")["image_b64"]
+            # Keep Page Elements on the canonical page raster.  The separate
+            # fit-to-model raster is useful as a fallback/transport artifact,
+            # but using it as the primary detector input makes scanned pages
+            # collapse into giant infographic boxes and removes paragraph
+            # regions before OCR gets a chance to run.
+            detector_image = row.get("page_image") or row.get("page_elements_image")
+            b64 = detector_image["image_b64"]
             if not b64:
                 raise ValueError("No usable image_b64 found in row.")
             row_b64.append(b64)
+            page_image = row.get("page_image") or detector_image
+            row_scan_b64.append(page_image.get("image_b64") if isinstance(page_image, dict) else b64)
             if use_remote:
                 row_tensors.append(None)
                 row_shapes.append(None)
@@ -537,6 +744,7 @@ def detect_page_elements_v3(
             row_tensors.append(None)
             row_shapes.append(None)
             row_b64.append(None)
+            row_scan_b64.append(None)
             row_payloads.append(_error_payload(stage="decode_image", exc=e))
 
     # Run inference over only valid rows, but write results back in original order.
@@ -549,14 +757,27 @@ def detect_page_elements_v3(
         raise ImportError("torch is required for page element detection.")
 
     if use_remote and valid_indices:
-        valid_b64: List[str] = []
+        remote_requests: List[Tuple[int, List[float], str]] = []
         for row_i in valid_indices:
             b64 = row_b64[row_i]
             if b64:
-                valid_b64.append(b64)
+                # Keep a full-page request for large regions. On scan pages,
+                # add overlapping high-resolution tiles for small regions.
+                remote_requests.append((row_i, [0.0, 0.0, 1.0, 1.0], b64))
+                metadata = pages_df.iloc[row_i].get("metadata") or {}
+                is_scan = isinstance(metadata, dict) and bool(
+                    metadata.get("needs_ocr_for_text") or not metadata.get("has_text", True)
+                )
+                if is_scan and _ENABLE_SCAN_PAGE_ELEMENT_TILES:
+                    scan_b64 = row_scan_b64[row_i] or b64
+                    remote_requests.extend(
+                        (row_i, tile_bbox, tile_b64)
+                        for tile_bbox, tile_b64 in _scan_tiles_from_b64(scan_b64)
+                    )
 
         t0 = time.perf_counter()
         try:
+            valid_b64 = [b64 for _row_i, _tile_bbox, b64 in remote_requests]
             _invoke_kw = dict(
                 invoke_url=invoke_url,
                 image_b64_list=valid_b64,
@@ -575,20 +796,58 @@ def detect_page_elements_v3(
                 )
             elapsed = time.perf_counter() - t0
 
-            if len(response_items) != len(valid_indices):
+            if len(response_items) != len(remote_requests):
                 raise RuntimeError(
-                    "Remote response count mismatch: " f"expected {len(valid_indices)}, got {len(response_items)}"
+                    "Remote response count mismatch: "
+                    f"expected {len(remote_requests)}, got {len(response_items)}"
                 )
 
-            for local_i, row_i in enumerate(valid_indices):
-                dets = _remote_response_to_detections(
+            full_page_detections: Dict[int, List[Dict[str, Any]]] = {row_i: [] for row_i in valid_indices}
+            tile_detections: Dict[int, List[Dict[str, Any]]] = {row_i: [] for row_i in valid_indices}
+            request_counts: Dict[int, int] = {row_i: 0 for row_i in valid_indices}
+            for local_i, (row_i, tile_bbox, _tile_b64) in enumerate(remote_requests):
+                metadata = pages_df.iloc[row_i].get("metadata") or {}
+                is_scan = isinstance(metadata, dict) and bool(
+                    metadata.get("needs_ocr_for_text") or not metadata.get("has_text", True)
+                )
+                tile_dets = _remote_response_to_detections(
                     response_json=response_items[local_i],
                     label_names=label_names,
                     thresholds_per_class=thresholds_per_class,
+                    # NIM already returns normalized page boxes. The generic
+                    # v3 expansion/matching pass is useful for native pages,
+                    # but on scans it can merge a distant title into a table
+                    # and materially enlarge the crop used by OCR.
+                    # Apply the v3 expansion/matching pass once, after all
+                    # full-page responses have been collected. Applying it
+                    # here and again below expands visual boxes twice.
+                    apply_v3_postprocess=False,
                 )
+                mapped = [_map_detection_bbox_to_page(detection, tile_bbox) for detection in tile_dets]
+                if tile_bbox == [0.0, 0.0, 1.0, 1.0]:
+                    full_page_detections[row_i].extend(mapped)
+                else:
+                    tile_detections[row_i].extend(mapped)
+                request_counts[row_i] += 1
+
+            for row_i in valid_indices:
+                metadata = pages_df.iloc[row_i].get("metadata") or {}
+                is_scan = isinstance(metadata, dict) and bool(
+                    metadata.get("needs_ocr_for_text") or not metadata.get("has_text", True)
+                )
+                full_dets = full_page_detections[row_i]
+                if not is_scan:
+                    full_dets = _apply_page_elements_v3_postprocess(full_dets)
+                full_dets = _apply_final_score_filter(full_dets)
+                tile_dets = _apply_final_score_filter(tile_detections[row_i])
+                dets = _merge_scan_visual_detections(full_dets, tile_dets)
                 row_payloads[row_i] = {
                     "detections": dets,
-                    "timing": {"seconds": float(elapsed)},
+                    "timing": {
+                        "seconds": float(elapsed),
+                        "inference_requests": int(request_counts.get(row_i, 0)),
+                        "tiled": bool(request_counts.get(row_i, 0) > 1),
+                    },
                     "error": None,
                 }
         except BaseException as e:

@@ -20,6 +20,7 @@ class FileCategory(str, Enum):
     DOCUMENT = "document"
     TEXT = "text"
     HTML = "html"
+    SPREADSHEET = "spreadsheet"
     IMAGE = "image"
     AUDIO = "audio"
     VIDEO = "video"
@@ -38,10 +39,11 @@ class FileClassifier:
     """Identify uploaded file types from filename suffix.
 
     Supported extensions are derived from the pipeline's extraction operators:
-      - multi_type_extract_operator.py  (PDF, text, html, image, audio, video)
+      - multi_type_extract_operator.py  (PDF, text, html, spreadsheet, image, audio, video)
       - utils/input_files.py            (CLI input type patterns)
       - audio/stage.py                  (ffmpeg-capable containers)
-      - utils/convert/to_pdf.py         (office → PDF conversion)
+      - utils/convert/to_pdf.py         (DOCX/PPTX office → PDF conversion)
+      - common/modality/spreadsheet.py  (XLSX/XLS/CSV native extraction)
     """
 
     SUFFIX_MAP: ClassVar[dict[str, tuple[FileCategory, str]]] = {
@@ -54,6 +56,10 @@ class FileClassifier:
         ".md": (FileCategory.TEXT, "text/plain"),
         ".json": (FileCategory.TEXT, "text/plain"),
         ".sh": (FileCategory.TEXT, "text/plain"),
+        # Spreadsheet / delimited data
+        ".xlsx": (FileCategory.SPREADSHEET, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ".xls": (FileCategory.SPREADSHEET, "application/vnd.ms-excel"),
+        ".csv": (FileCategory.SPREADSHEET, "text/csv"),
         # Web / markup
         ".html": (FileCategory.HTML, "text/html"),
         # Image
@@ -122,7 +128,7 @@ _MEDIA_CATEGORIES: frozenset[FileCategory] = frozenset({FileCategory.AUDIO, File
 def infer_extraction_mode_from_filename(filename: str) -> str | None:
     """Map a filename suffix to a GraphIngestor ``extraction_mode`` string.
 
-    Returns ``"text"`` / ``"html"`` / ``"image"`` / ``"audio"`` / ``"video"``
+    Returns ``"text"`` / ``"html"`` / ``"spreadsheet"`` / ``"image"`` / ``"audio"`` / ``"video"``
     / ``"pdf"`` for known extensions, or ``None`` when the suffix is not in
     :attr:`FileClassifier.SUFFIX_MAP`. Used by the service worker to avoid
     routing text-like uploads through the PDF or audio-only graphs when the
@@ -138,6 +144,8 @@ def infer_extraction_mode_from_filename(filename: str) -> str | None:
         return "text"
     if category == FileCategory.HTML:
         return "html"
+    if category == FileCategory.SPREADSHEET:
+        return "spreadsheet"
     if category == FileCategory.IMAGE:
         return "image"
     if category == FileCategory.AUDIO:
@@ -161,7 +169,8 @@ def category_requires_media_deps(category: FileCategory) -> bool:
     Only audio and video uploads exercise the ``MediaChunkActor`` /
     ``MediaInterface`` code paths that shell out to ``ffmpeg`` and
     ``ffprobe``. PDF / image / text / HTML uploads are unaffected by
-    media-dependency availability.
+    media-dependency availability. Native spreadsheet parsing is CPU-only and
+    does not require media dependencies.
     """
     return category in _MEDIA_CATEGORIES
 

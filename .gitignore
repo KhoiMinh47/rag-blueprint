@@ -219,6 +219,20 @@ processed_docs
 # Ignore devcontainer volumes
 .volumes
 
+# Local Docker BuildKit cache
+/cache/docker/retriever-build/
+
+# Local runtime state, downloaded model weights, container bind mounts and
+# machine-specific configuration. Recreate these from setup.md.
+/cache/
+/.config/
+
+# Generated/local documents that are not source code.
+NỘI QUY LAO ĐỘNG.pdf
+bao_cao_pipeline_6_7.pdf
+fullbaocao.pdf
+thongtinbaocao.pdf
+
 
 # Ignore generate docs site
 docs/site

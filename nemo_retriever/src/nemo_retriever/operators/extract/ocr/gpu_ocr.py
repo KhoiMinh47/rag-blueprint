@@ -12,12 +12,11 @@ from nemo_retriever.operators.abstract_operator import AbstractOperator
 from nemo_retriever.operators.gpu_operator import GPUOperator
 from nemo_retriever.models.nim.nim import NIMClient
 from nemo_retriever.common.params import RemoteRetryParams
-from nemo_retriever.common.modality.ocr.config import resolve_ocr_v2_lang
 from nemo_retriever.common.modality.ocr.shared import Image, _error_payload, ocr_page_elements
 
 
 class OCRActor(AbstractOperator, GPUOperator):
-    """Ray-friendly callable that initializes Nemotron OCR v2 once per actor."""
+    """Ray-friendly callable for integrated or split remote OCR services."""
 
     def __init__(self, **ocr_kwargs: Any) -> None:
         super().__init__(**ocr_kwargs)
@@ -28,8 +27,21 @@ class OCRActor(AbstractOperator, GPUOperator):
 
         self.ocr_kwargs = dict(ocr_kwargs)
         invoke_url = str(self.ocr_kwargs.get("ocr_invoke_url") or self.ocr_kwargs.get("invoke_url") or "").strip()
-        if invoke_url and "invoke_url" not in self.ocr_kwargs:
+        split_remote = bool(
+            str(self.ocr_kwargs.get("line_detector_invoke_url") or "").strip()
+            and str(self.ocr_kwargs.get("ocr_recognizer_invoke_url") or "").strip()
+        )
+        box_remote = bool(
+            self.ocr_kwargs.get("ocr_pipeline") == "pipeline-tesseract"
+            and str(self.ocr_kwargs.get("ocr_recognizer_invoke_url") or "").strip()
+        )
+        if invoke_url:
             self.ocr_kwargs["invoke_url"] = invoke_url
+        if not invoke_url and not (split_remote or box_remote):
+            raise ValueError(
+                "OCR requires ocr_invoke_url, a detector/recognizer pair, or "
+                "pipeline-tesseract with ocr_recognizer_invoke_url"
+            )
 
         self.ocr_kwargs["extract_text"] = bool(self.ocr_kwargs.get("extract_text", False))
         self.ocr_kwargs["extract_tables"] = bool(self.ocr_kwargs.get("extract_tables", False))
@@ -44,22 +56,8 @@ class OCRActor(AbstractOperator, GPUOperator):
             remote_max_retries=int(self.ocr_kwargs.get("remote_max_retries", 10)),
             remote_max_429_retries=int(self.ocr_kwargs.get("remote_max_429_retries", 5)),
         )
-        if invoke_url:
-            self._model = None
-            self._nim_client = NIMClient(
-                max_pool_workers=int(self._remote_retry.remote_max_pool_workers),
-            )
-        else:
-            from nemo_retriever.models.local import NemotronOCRV2
-            from nemo_retriever.models.warmup_registry import get_warmed_model
-
-            lang = resolve_ocr_v2_lang(
-                str(self.ocr_kwargs.get("ocr_version", "v2")),
-                self.ocr_kwargs.get("ocr_lang"),
-            )
-            warmed = get_warmed_model("ocr")
-            self._model = warmed if warmed is not None else NemotronOCRV2(lang=lang)
-            self._nim_client = None
+        self._model = None
+        self._nim_client = NIMClient(max_pool_workers=int(self._remote_retry.remote_max_pool_workers))
 
     def preprocess(self, data: Any, **kwargs: Any) -> Any:
         return data

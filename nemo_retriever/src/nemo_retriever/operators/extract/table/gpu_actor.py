@@ -12,7 +12,6 @@ from nemo_retriever.operators.abstract_operator import AbstractOperator
 from nemo_retriever.operators.gpu_operator import GPUOperator
 from nemo_retriever.models.nim.nim import NIMClient
 from nemo_retriever.common.params import RemoteRetryParams
-from nemo_retriever.common.modality.ocr.config import resolve_ocr_v2_lang
 from nemo_retriever.common.modality.table.shared import (
     table_structure_ocr_page_elements,
 )
@@ -28,9 +27,6 @@ class TableStructureActor(AbstractOperator, GPUOperator):
         self,
         *,
         table_structure_invoke_url: Optional[str] = None,
-        ocr_invoke_url: Optional[str] = None,
-        ocr_version: str = "v2",
-        ocr_lang: Optional[str] = None,
         invoke_url: Optional[str] = None,
         api_key: Optional[str] = None,
         table_output_format: Optional[str] = None,
@@ -41,7 +37,6 @@ class TableStructureActor(AbstractOperator, GPUOperator):
     ) -> None:
         super().__init__()
         self._table_structure_invoke_url = (table_structure_invoke_url or invoke_url or "").strip()
-        self._ocr_invoke_url = (ocr_invoke_url or "").strip()
         self._api_key = api_key
         self._request_timeout_s = float(request_timeout_s)
         self._table_output_format = table_output_format
@@ -60,20 +55,7 @@ class TableStructureActor(AbstractOperator, GPUOperator):
             warmed = get_warmed_model("table_structure")
             self._table_structure_model = warmed if warmed is not None else NemotronTableStructureV1()
 
-        if self._ocr_invoke_url:
-            self._ocr_model = None
-        else:
-            from nemo_retriever.models.local import NemotronOCRV2
-            from nemo_retriever.models.warmup_registry import get_warmed_model
-
-            warmed = get_warmed_model("ocr")
-            if warmed is not None:
-                self._ocr_model = warmed
-            else:
-                lang = resolve_ocr_v2_lang(ocr_version, ocr_lang)
-                self._ocr_model = NemotronOCRV2(lang=lang)
-
-        if self._table_structure_invoke_url or self._ocr_invoke_url:
+        if self._table_structure_invoke_url:
             self._nim_client = NIMClient(
                 max_pool_workers=int(remote_max_pool_workers),
             )
@@ -114,7 +96,13 @@ class TableStructureActor(AbstractOperator, GPUOperator):
                     },
                 }
                 n = len(out.index)
+                structure_payload = {
+                    "regions": [],
+                    "timing": None,
+                    "error": payload["error"],
+                }
                 out["table"] = [[] for _ in range(n)]
+                out["table_structure_v1"] = [structure_payload for _ in range(n)]
                 out["table_structure_ocr_v1"] = [payload for _ in range(n)]
                 out["table_structure_v1_num_detections"] = [0 for _ in range(n)]
                 out["table_structure_v1_counts_by_label"] = [{} for _ in range(n)]

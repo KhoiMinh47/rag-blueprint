@@ -41,7 +41,7 @@ class LocalExtractConfig(RichModel):
     enabled: bool = True
     use_table_structure: bool = True
     ocr_version: Literal["v1", "v2"] = "v2"
-    ocr_lang: Literal["multi", "english"] | None = None
+    ocr_lang: Literal["multi", "english", "vietnamese"] | None = None
 
 
 class LocalEmbedConfig(RichModel):
@@ -128,9 +128,27 @@ class NimEndpointsConfig(RichModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Legacy direct PP-OCRv6 endpoint. Option 2 itself uses the page detector,
+    # table structure, and language-routed OCR endpoints below.
+    official_ppocr_invoke_url: str | None = None
+    # Kept for backwards-compatible configuration files from the earlier
+    # PaddleOCR-VL experiment. Option 2 no longer uses this endpoint.
+    paddleocr_vl_invoke_url: str | None = None
     page_elements_invoke_url: str | None = None
     ocr_invoke_url: str | None = None
+    line_detector_invoke_url: str | None = None
+    ocr_recognizer_invoke_url: str | None = None
+    tesseract_ocr_invoke_url: str | None = None
+    vintern_ocr_invoke_url: str | None = None
+    # Pipeline 7: server-owned OpenAI-compatible Ministral 3B VLM endpoint.
+    ministral_vlm_invoke_url: str | None = None
+    # Option 3 only.  The default sidecar implementation is VietOCR; this
+    # endpoint remains server-owned so a future recognizer can be swapped in
+    # without changing the public selector or router.
+    vietnamese_ocr_invoke_url: str | None = None
     table_structure_invoke_url: str | None = None
+    stamp_detection_invoke_url: str | None = None
+    stamp_detection_min_score: float | None = None
     embed_invoke_url: str | None = None
     embed_model_name: str | None = Field(
         default=None,

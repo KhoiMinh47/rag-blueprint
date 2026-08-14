@@ -217,11 +217,19 @@ _SERVER_OWNED_KEYS: frozenset[str] = frozenset(
     {
         "invoke_url",
         "api_key",
+        "official_ppocr_invoke_url",
+        "paddleocr_vl_invoke_url",
         "page_elements_invoke_url",
         "page_elements_api_key",
-        "ocr_invoke_url",
+        "line_detector_invoke_url",
+        "ocr_recognizer_invoke_url",
         "ocr_api_key",
+        "vintern_ocr_invoke_url",
+        "ministral_vlm_invoke_url",
+        "vietnamese_ocr_invoke_url",
         "table_structure_invoke_url",
+        "stamp_detection_invoke_url",
+    "stamp_detection_invoke_url",
         "nemotron_parse_invoke_url",
         "embed_invoke_url",
         "embedding_endpoint",
@@ -562,7 +570,7 @@ class ServiceIngestor(ingestor):
         spec["return_embeddings"] = bool(return_embeddings or spec.get("return_embeddings", False))
         spec["return_images"] = bool(return_images or spec.get("return_images", False))
         is_empty = (
-            spec.get("extraction_mode", "auto") in ("pdf", "auto")
+        spec.get("extraction_mode", "auto") in ("pdf", "auto")
             and not spec.get("stage_order")
             and not any(
                 spec.get(k)

@@ -16,7 +16,7 @@ def test_resolve_split_params_behavior():
     """Single omnibus test: defaults, dict overrides, False off-switch, unknown key validation."""
     # Chunking is opt-in on every key — None / missing keys resolve to None.
     out = resolve_split_params(None)
-    assert all(out[key] is None for key in ("text", "html", "pdf", "audio", "image", "video"))
+    assert all(out[key] is None for key in ("text", "html", "pdf", "spreadsheet", "audio", "image", "video"))
 
     # Dict override builds the appropriate chunk-params instance per key.
     out = resolve_split_params({"pdf": {"max_tokens": 256}, "html": {"max_tokens": 333}, "text": False})

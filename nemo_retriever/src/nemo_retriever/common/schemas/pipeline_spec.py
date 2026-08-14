@@ -35,7 +35,7 @@ from pydantic import ConfigDict, Field
 from nemo_retriever.common.schemas.base import RichModel
 
 
-ExtractionMode = Literal["pdf", "image", "auto", "text", "html", "audio"]
+ExtractionMode = Literal["pdf", "image", "auto", "text", "html", "spreadsheet", "audio"]
 StageName = Literal["extract", "dedup", "caption", "embed", "store", "filter", "webhook"]
 
 
@@ -70,6 +70,20 @@ class PipelineSpec(RichModel):
     # Extraction stage selector (mirrors GraphIngestor._extraction_mode).
     extraction_mode: ExtractionMode = "auto"
 
+    # OCR implementation selected by the upload/debug UI.  The service owns
+    # the endpoint wiring; clients can select only one of the named,
+    # operator-provisioned pipelines.
+    ocr_pipeline: Literal[
+        "pipeline-nemotron-ocr",
+        "pipeline-ppocrv6",
+        "pipeline-tesseract",
+        "pipeline-option3",
+        "pipeline-option4",
+        "pipeline-option5",
+        "pipeline-option6",
+        "pipeline-option7",
+    ] | None = None
+
     extract_params: Optional[dict[str, Any]] = None
     embed_params: Optional[dict[str, Any]] = None
     dedup_params: Optional[dict[str, Any]] = None
@@ -98,6 +112,14 @@ class PipelineSpec(RichModel):
         default=False,
         description="Include raw image payload values in legacy transport rows.",
     )
+    visual_evidence: bool = Field(
+        default=False,
+        description=(
+            "Retain a compact dashboard payload containing one page image and "
+            "normalized text/content bounding boxes per page. This is separate "
+            "from legacy result_data image retention."
+        ),
+    )
 
     def is_empty(self) -> bool:
         """``True`` when the client supplied no overrides and no stage_order.
@@ -107,6 +129,7 @@ class PipelineSpec(RichModel):
         """
         return (
             self.extraction_mode in ("pdf", "auto")
+            and self.ocr_pipeline is None
             and self.extract_params is None
             and self.embed_params is None
             and self.dedup_params is None
@@ -120,4 +143,5 @@ class PipelineSpec(RichModel):
             and self.result_schema == "legacy"
             and not self.return_embeddings
             and not self.return_images
+            and not self.visual_evidence
         )

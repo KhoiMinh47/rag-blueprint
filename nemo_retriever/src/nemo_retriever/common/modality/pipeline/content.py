@@ -14,7 +14,7 @@ from nemo_retriever.common.io.image_store import inline_image_b64
 from nemo_retriever.operators.extract.ocr.ocr import _crop_b64_image_by_norm_bbox
 from nemo_retriever.common.params.models import IMAGE_MODALITIES
 
-_CONTENT_COLUMNS = ("table", "chart", "infographic")
+_CONTENT_COLUMNS = ("table", "chart", "infographic", "stamp")
 
 
 def _combine_text_with_content(row: Any, text_column: str, content_columns: Sequence[str]) -> str:

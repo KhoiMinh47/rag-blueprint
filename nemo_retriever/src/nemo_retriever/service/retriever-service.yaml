@@ -30,9 +30,26 @@ logging:
 # Multiple endpoints per model:  Provide a comma-separated list of URLs
 # to spread load across replicas.
 nim_endpoints:
+  # Official PP-OCRv6 general OCR pipeline for upload Option 2.
+  official_ppocr_invoke_url: null
+  # Legacy PaddleOCR-VL field retained only so old config files still parse.
+  paddleocr_vl_invoke_url: null
   page_elements_invoke_url: null
   table_structure_invoke_url: null
+  # Primary integrated detector + recognizer (Nemotron OCR v2).
   ocr_invoke_url: null
+  vintern_ocr_invoke_url: null
+  # Pipeline 7: OpenAI-compatible Ministral 3B VLM endpoint.
+  ministral_vlm_invoke_url: null
+  # Option 3 Vietnamese recognizer endpoint (VietOCR sidecar by default).
+  vietnamese_ocr_invoke_url: null
+  # Optional split fallback, used only when ocr_invoke_url is empty.
+  line_detector_invoke_url: null
+  ocr_recognizer_invoke_url: null
+  # Legacy CPU Tesseract endpoint; Option 2 now uses paddleocr_vl_invoke_url.
+  tesseract_ocr_invoke_url: null
+  stamp_detection_invoke_url: null
+  stamp_detection_min_score: 0.50
   embed_invoke_url: null
   # Model name for the remote embed NIM (server-owned; must match the SKU).
   embed_model_name: null

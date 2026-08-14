@@ -74,6 +74,65 @@ def test_build_extract_params_local_enables_table_structure() -> None:
     assert ep.use_table_structure is True
     assert ep.ocr_version == "v2"
     assert ep.page_elements_invoke_url is None
+    assert ep.method == "pdfium_hybrid"
+
+
+def test_build_extract_params_remote_ocr_uses_hybrid_pdf_fallback() -> None:
+    nim = NimEndpointsConfig(ocr_invoke_url="http://ocr-nim/v1/ocr")
+    ep = build_extract_params(nim, LocalModelsConfig())
+    assert ep.method == "pdfium_hybrid"
+    assert ep.ocr_invoke_url == "http://ocr-nim/v1/ocr"
+
+
+def test_build_extract_params_defaults_to_ministral_semantic_pipeline_when_configured() -> None:
+    nim = NimEndpointsConfig(
+        ministral_vlm_invoke_url="http://ministral/v1/chat/completions",
+        page_elements_invoke_url="http://page-elements/v1",
+        table_structure_invoke_url="http://table/v1",
+        official_ppocr_invoke_url="http://ppocr-official/v1/ocr",
+        paddleocr_vl_invoke_url="http://paddleocr-vl/v1/parse",
+        ocr_invoke_url="http://nim-ocr/v1/ocr",
+        line_detector_invoke_url="http://ppocr-det/v1/detect",
+        ocr_recognizer_invoke_url="http://ppocr-rec/v1/recognize",
+        tesseract_ocr_invoke_url="http://tesseract/v1/ocr",
+        vintern_ocr_invoke_url="http://vintern/v1/chat/completions",
+        vietnamese_ocr_invoke_url="http://vietocr/v1/ocr",
+    )
+    ep = build_extract_params(nim, LocalModelsConfig(enabled=True))
+
+    assert ep.ocr_pipeline == "pipeline-option7"
+    assert ep.method == "pdfium_hybrid"
+    assert ep.extract_page_as_image is True
+    assert ep.use_page_elements is True
+    assert ep.use_table_structure is False
+    assert ep.table_structure_invoke_url is None
+    assert ep.ocr_invoke_url is None
+    # Keep the server-owned Qwen endpoint available for an explicit Option 6
+    # request. Pipeline 7 selects Ministral through its own endpoint.
+    assert ep.vintern_ocr_invoke_url == "http://vintern/v1/chat/completions"
+    assert ep.line_detector_invoke_url is None
+    assert ep.ocr_recognizer_invoke_url is None
+    assert ep.tesseract_ocr_invoke_url is None
+    assert ep.vietnamese_ocr_invoke_url is None
+
+
+def test_build_extract_params_keeps_nemotron_primary_when_split_fallback_is_configured() -> None:
+    nim = NimEndpointsConfig(
+        ocr_invoke_url="http://ocr-nim/v1/ocr",
+        line_detector_invoke_url="http://pp-det/v1/detect",
+        ocr_recognizer_invoke_url="http://pp-rec/v1/recognize",
+    )
+    ep = build_extract_params(nim, LocalModelsConfig())
+
+    assert ep.method == "pdfium_hybrid"
+    assert ep.ocr_invoke_url == "http://ocr-nim/v1/ocr"
+    assert ep.line_detector_invoke_url == "http://pp-det/v1/detect"
+    assert ep.ocr_recognizer_invoke_url == "http://pp-rec/v1/recognize"
+
+
+def test_build_extract_params_without_ocr_keeps_native_pdfium() -> None:
+    ep = build_extract_params(NimEndpointsConfig(), LocalModelsConfig())
+    assert ep.method == "pdfium"
 
 
 def test_build_extract_params_nim_url_wins_over_local_flags() -> None:

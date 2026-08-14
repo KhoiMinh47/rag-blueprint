@@ -175,6 +175,35 @@ class TestMultimodalCallableRunner:
 
 
 class TestExplodeContentToRows:
+    def test_missing_list_columns_are_empty_after_dataframe_alignment(self):
+        """Pandas NaN placeholders must not be iterated as structured content."""
+        df = pd.DataFrame(
+            [
+                {
+                    "path": "mixed.pdf",
+                    "page_number": 1,
+                    "text": "page one",
+                    "table": [{"text": "table one"}],
+                    "images": [],
+                },
+                {
+                    "path": "mixed.pdf",
+                    "page_number": 2,
+                    "text": "page two",
+                    "chart": [{"text": "chart two"}],
+                },
+            ]
+        )
+
+        result = explode_content_to_rows(df)
+
+        assert sorted(result["text"].tolist()) == [
+            "chart two",
+            "page one",
+            "page two",
+            "table one",
+        ]
+
     def test_text_mode_tags_modality(self):
         """Default text mode tags every row with _embed_modality='text' and no _image_b64."""
         df = pd.DataFrame(

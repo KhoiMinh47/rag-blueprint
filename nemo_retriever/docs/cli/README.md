@@ -258,8 +258,8 @@ These options apply to `retriever ingest`, `retriever ingest local`, and
 | `--index-mode` | `dense` | Dense vector index by default; `hybrid` also builds BM25/FTS and `sparse` builds an FTS-only table. |
 | `--method` | planner default | PDF extraction method such as `pdfium` or `nemotron_parse`. |
 | `--extract-text`, `--extract-tables`, `--extract-charts` | planner default | Enable or disable extraction families. |
-| `--ocr-version` | planner default | OCR engine version for local extraction. |
-| `--ocr-lang` | planner default | OCR v2 language selector for local extraction. |
+| `--ocr-version` | planner default | Nemotron OCR engine version selector. |
+| `--ocr-lang` | planner default | OCR v2 language selector; remote NIMs own their deployed language profile. |
 | `--caption` | off | Add a captioning stage. |
 | `--caption-model-name` | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` | Local vLLM caption model. The default has approximately 62 GiB of BF16 weights and requires correspondingly larger GPU capacity; Nano models remain available as explicit overrides. For remote endpoints, pass the endpoint API model ID. |
 | `--dedup` | off | Add image deduplication before captioning and embedding. |
@@ -320,11 +320,11 @@ retriever ingest ./data/pdf_corpus \
 ```bash
 retriever ingest ./data/scanned.pdf \
   --ocr-version v2 \
-  --ocr-lang english
+  --ocr-lang multi
 ```
 
-For mixed-script documents, use `--ocr-lang multi` where supported by the local
-OCR engine.
+For a remote NIM, `--ocr-invoke-url` selects the integrated Nemotron OCR v2
+service. Split line-detector/recognizer URLs are fallback-only.
 
 ### Text chunking
 

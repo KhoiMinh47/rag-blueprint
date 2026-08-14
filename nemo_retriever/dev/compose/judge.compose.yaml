@@ -16,6 +16,8 @@ services:
       - NIM_HTTP_API_PORT=8000
       - NGC_API_KEY=${NIM_NGC_API_KEY:-${NGC_API_KEY:?NGC_API_KEY or NIM_NGC_API_KEY must be set}}
     command: ["--tool-call-parser", "llama3_json", "--enable-auto-tool-choice"]
+    volumes:
+      - ../../../cache/judge:/opt/nim/.cache:rw
     deploy:
       resources:
         reservations:

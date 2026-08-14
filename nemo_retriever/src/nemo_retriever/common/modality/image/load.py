@@ -20,7 +20,7 @@ from io import BytesIO
 from typing import Any, Dict
 
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageOps
 
 # Raster formats handled natively by Pillow.
 _RASTER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"}
@@ -93,7 +93,10 @@ def image_bytes_to_pages_df(content_bytes: bytes, path: str) -> pd.DataFrame:
         if ext in _SVG_EXTENSIONS:
             img = _svg_to_pil(content_bytes)
         elif ext in _RASTER_EXTENSIONS:
-            img = Image.open(BytesIO(content_bytes)).convert("RGB")
+            # Normalize camera-image orientation before any detector/OCR bbox
+            # is created.  The PNG emitted below has no EXIF ambiguity left.
+            with Image.open(BytesIO(content_bytes)) as source:
+                img = ImageOps.exif_transpose(source).convert("RGB")
         else:
             return _error_record(path, f"Unsupported image format: {ext}")
 

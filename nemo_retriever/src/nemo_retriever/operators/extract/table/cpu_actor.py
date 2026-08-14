@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 class TableStructureCPUActor(AbstractOperator, CPUOperator):
     """CPU-only variant of :class:`TableStructureActor`.
 
-    Uses NVIDIA's hosted table-structure service by default. OCR is not turned on
-    unless you provide an ``ocr_invoke_url``.
+    Uses the table-structure service only. PP-OCRv6 recognizes cells in the
+    following document OCR stage.
     """
 
     DEFAULT_TABLE_STRUCTURE_INVOKE_URL = "https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-table-structure-v1"
@@ -58,7 +58,6 @@ class TableStructureCPUActor(AbstractOperator, CPUOperator):
             remote_max_429_retries=int(remote_max_429_retries),
         )
         self._table_structure_model = None
-        self._ocr_model = None
         self._nim_client = NIMClient(
             max_pool_workers=int(remote_max_pool_workers),
         )
@@ -123,7 +122,13 @@ class TableStructureCPUActor(AbstractOperator, CPUOperator):
                     },
                 }
                 n = len(out.index)
+                structure_payload = {
+                    "regions": [],
+                    "timing": None,
+                    "error": payload["error"],
+                }
                 out["table"] = [[] for _ in range(n)]
+                out["table_structure_v1"] = [structure_payload for _ in range(n)]
                 out["table_structure_ocr_v1"] = [payload for _ in range(n)]
                 out["table_structure_v1_num_detections"] = [0 for _ in range(n)]
                 out["table_structure_v1_counts_by_label"] = [{} for _ in range(n)]

@@ -140,7 +140,7 @@ def build_embed_kwargs(resolved: Any, *, include_batch_tuning: bool = False) -> 
     return normalize_embed_kwargs(kwargs)
 
 
-SPLIT_CONFIG_VALID_KEYS = frozenset({"text", "html", "pdf", "audio", "image", "video"})
+SPLIT_CONFIG_VALID_KEYS = frozenset({"text", "html", "pdf", "spreadsheet", "audio", "image", "video"})
 
 
 def resolve_split_params(

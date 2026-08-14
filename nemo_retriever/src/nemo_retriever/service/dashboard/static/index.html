@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="vi">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>NeMo Retriever — Dashboard</title>
+<title>NeMo Retriever — Bảng điều khiển</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
 <style>
@@ -188,30 +188,116 @@ tr:hover td { background: var(--nv-row-hover); }
 </style>
 </head>
 <body>
-<div id="root"></div>
-
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<div id="root">
+  <div style="padding:32px;color:#888;font-family:system-ui">Đang tải bảng điều khiển…</div>
+</div>
 
 <script>
+  // Keep a visible diagnostic if a browser/network blocks a CDN dependency.
+  window.__nemoDependencyError = function (name) {
+    const root = document.getElementById('root');
+    if (root) {
+      root.innerHTML = '<div style="padding:32px;color:#ff5050;background:#0e0e0e;min-height:100vh;font-family:system-ui">Không tải được thư viện giao diện ' + name + '. Kiểm tra kết nối CDN rồi tải lại trang.</div>';
+    }
+  };
+</script>
+<script>
 (async function loadViews() {
+  // These .jsx files currently contain plain classic JavaScript using
+  // React.createElement; they do not need a Babel runtime in the browser.
+  // Removing that extra transform also makes the dashboard work when the
+  // Babel CDN is unavailable or a transform stalls on one view.
+  const root = document.getElementById('root');
+  const showLoaderError = (message) => {
+    root.innerHTML = `<div style="padding:32px;font-family:system-ui;color:#ff5050;background:#0e0e0e;min-height:100vh">
+      <h2 style="margin-bottom:12px">Không tải được bảng điều khiển</h2>
+      <pre style="white-space:pre-wrap;color:#e0e0e0">${String(message)}</pre>
+      <p style="margin-top:16px;color:#888">Kiểm tra tab Network của trình duyệt với /v1/dashboard/static/views/*.jsx.</p>
+    </div>`;
+  };
+  window.__nemoDashboardReady = false;
+  window.addEventListener('error', (event) => {
+    if (!window.__nemoDashboardReady) showLoaderError(event.error || event.message || 'Unknown JavaScript error');
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    if (!window.__nemoDashboardReady) showLoaderError(event.reason || 'Unhandled dashboard promise rejection');
+  });
+  window.setTimeout(() => {
+    if (!window.__nemoDashboardReady) {
+      showLoaderError('Dashboard không hoàn tất khởi tạo sau 5 giây. Kiểm tra React CDN hoặc lỗi thực thi bundle.');
+    }
+  }, 5000);
+
+  // Load CDN dependencies in sequence.  A plain script tag with an onerror
+  // fallback changes `src` but does not make the following inline loader wait
+  // for that second request.  That race leaves a blank page when the primary
+  // CDN is slow or blocked by the browser.
+  function loadExternalScript(name, urls) {
+    return new Promise((resolve, reject) => {
+      let index = 0;
+      const attempt = () => {
+        if (index >= urls.length) {
+          reject(new Error(`${name} không tải được từ các CDN dự phòng`));
+          return;
+        }
+        const url = urls[index++];
+        const script = document.createElement('script');
+        script.src = url;
+        script.async = false;
+        script.onload = () => resolve(url);
+        script.onerror = () => {
+          script.remove();
+          attempt();
+        };
+        document.head.appendChild(script);
+      };
+      attempt();
+    });
+  }
+
+  try {
+    await loadExternalScript('React', [
+      'https://unpkg.com/react@18/umd/react.production.min.js',
+      'https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js',
+    ]);
+    await loadExternalScript('ReactDOM', [
+      'https://unpkg.com/react-dom@18/umd/react-dom.production.min.js',
+      'https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js',
+    ]);
+    const pdfUrl = await loadExternalScript('PDF.js', [
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+      'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js',
+    ]);
+    if (window.pdfjsLib) {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = pdfUrl.includes('cdnjs')
+        ? 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+        : 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+    }
+  } catch (e) {
+    showLoaderError(e.message || e);
+    return;
+  }
+
   // Order matters: dependencies must come before consumers. `app.jsx`
-  // references every other view component, and `job_detail.jsx` is
-  // referenced from `app.jsx` but defines no top-level globals other
-  // than its own component name.
-  const views = ['layout', 'overview', 'jobs', 'job_detail', 'vdb', 'app'];
+  // references every other view component.
+  const views = ['debug_store', 'layout', 'overview', 'jobs', 'job_detail', 'vdb', 'ingest_debug', 'app'];
+  const assetVersion = Date.now().toString();
   for (const name of views) {
     try {
-      const resp = await fetch(`/v1/dashboard/static/views/${name}.jsx`);
-      if (!resp.ok) { console.error(`Failed to load ${name}.jsx: ${resp.status}`); continue; }
+      const resp = await fetch(`/v1/dashboard/static/views/${name}.jsx?v=${assetVersion}`, {
+        cache: 'no-store',
+      });
+      if (!resp.ok) throw new Error(`${name}.jsx: HTTP ${resp.status}`);
       const code = await resp.text();
-      const transformed = Babel.transform(code, { presets: ['react'] }).code;
       const script = document.createElement('script');
-      script.textContent = transformed;
+      script.textContent = `${code}\n//# sourceURL=/v1/dashboard/static/views/${name}.jsx`;
       document.body.appendChild(script);
-    } catch (e) { console.error(`Error loading ${name}.jsx:`, e); }
+    } catch (e) {
+      showLoaderError(`Loading ${name}.jsx failed: ${e.message || e}`);
+      return;
+    }
   }
+  if (!window.__nemoDashboardReady) showLoaderError('app.jsx did not render the dashboard root.');
 })();
 </script>
 </body>

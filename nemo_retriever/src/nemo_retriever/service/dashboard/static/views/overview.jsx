@@ -19,11 +19,11 @@ function OverviewView() {
 
   if (error) {
     return React.createElement('div', { className: 'empty-state' },
-      'Failed to load overview: ' + error
+      'Tải tổng quan thất bại: ' + error
     );
   }
   if (!data) {
-    return React.createElement('div', { className: 'empty-state' }, 'Loading…');
+    return React.createElement('div', { className: 'empty-state' }, 'Đang tải…');
   }
 
   const backends = data.backends || {};
@@ -54,25 +54,25 @@ function OverviewView() {
       name: 'Realtime',
       status: backends.realtime ? 'ok' : 'error',
       details: [
-        `Workers: ${workers.realtime_workers || '—'}`,
-        `Queue: ${poolBadge(poolStats.realtime) || workers.realtime_queue_size || '—'}`,
+        `Worker: ${workers.realtime_workers || '—'}`,
+        `Hàng đợi: ${poolBadge(poolStats.realtime) || workers.realtime_queue_size || '—'}`,
       ],
     },
     {
       name: 'Batch',
       status: backends.batch ? 'ok' : 'error',
       details: [
-        `Workers: ${workers.batch_workers || '—'}`,
-        `Queue: ${poolBadge(poolStats.batch) || workers.batch_queue_size || '—'}`,
+        `Worker: ${workers.batch_workers || '—'}`,
+        `Hàng đợi: ${poolBadge(poolStats.batch) || workers.batch_queue_size || '—'}`,
       ],
     },
     {
       name: 'VectorDB',
       status: vdb ? 'ok' : 'unknown',
       details: vdb ? [
-        `Table: ${vdb.table || '—'}`,
-        `Rows: ${(vdb.total_rows || 0).toLocaleString()}`,
-      ] : ['Not connected'],
+        `Bảng: ${vdb.table || '—'}`,
+        `Số row: ${(vdb.total_rows || 0).toLocaleString()}`,
+      ] : ['Chưa kết nối'],
     },
   ];
 
@@ -80,7 +80,7 @@ function OverviewView() {
 
     /* Topology */
     React.createElement('div', { className: 'section' },
-      React.createElement('div', { className: 'section-title' }, 'Pod Topology'),
+      React.createElement('div', { className: 'section-title' }, 'Sơ đồ dịch vụ'),
       React.createElement('div', { className: 'topology-grid' },
         pods.map(p =>
           React.createElement('div', { key: p.name, className: 'pod-card' },
@@ -99,7 +99,7 @@ function OverviewView() {
     /* Worker pool capacity (H6) — live per-pool queue fill, mirrors the
      * signal HPA uses. Only shows pools the backend reported on. */
     Object.keys(poolStats).length > 0 && React.createElement('div', { className: 'section' },
-      React.createElement('div', { className: 'section-title' }, 'Worker Pool Capacity'),
+      React.createElement('div', { className: 'section-title' }, 'Sức chứa worker pool'),
       React.createElement('div', { className: 'card-grid' },
         Object.entries(poolStats).map(([pool, stats]) => {
           const pct = Math.round((stats.queue_depth_ratio || 0) * 100);
@@ -115,9 +115,9 @@ function OverviewView() {
               : 'var(--nv-green)';
           return React.createElement('div', { key: pool, className: 'card' },
             React.createElement('div', { className: 'card-title' },
-              `${pool} pool`),
+              `Pool ${pool}`),
             React.createElement('div', { style: { fontSize: 13, marginBottom: 8, color: 'var(--nv-text-muted)' } },
-              `${stats.num_workers} workers · ${stats.processed.toLocaleString()} processed`),
+              `${stats.num_workers} worker · đã xử lý ${stats.processed.toLocaleString()}`),
             React.createElement('div', { className: 'progress-bar', style: { height: 22 } },
               React.createElement('div', {
                 className: 'progress-fill',
@@ -132,14 +132,14 @@ function OverviewView() {
 
     /* Job summary */
     React.createElement('div', { className: 'section' },
-      React.createElement('div', { className: 'section-title' }, 'Job Summary'),
+      React.createElement('div', { className: 'section-title' }, 'Tóm tắt job'),
       React.createElement('div', { className: 'card-grid' },
         [
-          { label: 'Total Tracked', value: summary.total_tracked || 0, cls: '' },
-          { label: 'Completed',     value: summary.completed || 0,      cls: 'badge-green' },
-          { label: 'Processing',    value: summary.processing || 0,     cls: 'badge-yellow' },
-          { label: 'Failed',        value: summary.failed || 0,         cls: 'badge-red' },
-          { label: 'Pending',       value: summary.pending || 0,        cls: 'badge-blue' },
+          { label: 'Tổng đã ghi nhận', value: summary.total_tracked || 0, cls: '' },
+          { label: 'Hoàn tất',     value: summary.completed || 0,      cls: 'badge-green' },
+          { label: 'Đang xử lý',    value: summary.processing || 0,     cls: 'badge-yellow' },
+          { label: 'Lỗi',        value: summary.failed || 0,         cls: 'badge-red' },
+          { label: 'Đang chờ',       value: summary.pending || 0,        cls: 'badge-blue' },
         ].map(s =>
           React.createElement('div', { key: s.label, className: 'card' },
             React.createElement('div', { className: 'card-title' }, s.label),
@@ -151,16 +151,16 @@ function OverviewView() {
 
     /* System info */
     React.createElement('div', { className: 'section' },
-      React.createElement('div', { className: 'section-title' }, 'System Configuration'),
+      React.createElement('div', { className: 'section-title' }, 'Cấu hình hệ thống'),
       React.createElement('div', { className: 'card' },
         React.createElement('table', null,
           React.createElement('tbody', null,
             [
-              ['Service Mode', data.mode],
-              ['Realtime Workers', workers.realtime_workers],
-              ['Realtime Queue Size', workers.realtime_queue_size],
-              ['Batch Workers', workers.batch_workers],
-              ['Batch Queue Size', workers.batch_queue_size],
+              ['Chế độ service', data.mode],
+              ['Worker realtime', workers.realtime_workers],
+              ['Kích thước hàng đợi realtime', workers.realtime_queue_size],
+              ['Worker batch', workers.batch_workers],
+              ['Kích thước hàng đợi batch', workers.batch_queue_size],
             ].map(([k, v]) =>
               React.createElement('tr', { key: k },
                 React.createElement('td', { style: { fontWeight: 600, width: '220px' } }, k),

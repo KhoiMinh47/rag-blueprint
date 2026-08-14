@@ -69,7 +69,6 @@ nemo_retriever/helm/
     └── nims/
         ├── nemotron-page-elements-v3.yaml    # direct-PVC NIMService by default
         ├── nemotron-table-structure-v1.yaml   # direct-PVC NIMService by default
-        ├── nemotron-ocr-v2.yaml               # direct-PVC NIMService by default
         ├── llama-nemotron-embed-vl-1b-v2.yaml           # NIMCache + NIMService (VLM embed)
         ├── llama-nemotron-rerank-vl-1b-v2.yaml  # NIMCache + NIMService (optional; not auto-wired)
         ├── nemotron-parse.yaml                # NIMCache + NIMService (optional; not auto-wired)
@@ -224,8 +223,8 @@ helm install retriever ./nemo_retriever/helm \
 >
 > This matches the "optional and disabled by default" contract in [deployment-options.md](https://github.com/NVIDIA/NeMo-Retriever/blob/main/docs/docs/extraction/deployment-options.md) and avoids silently pulling ≈ 62 GiB of Omni weights, loading a large two-GPU LLM, or claiming extra dedicated GPUs on a "default" install. Refer to the [model hardware requirements](https://github.com/NVIDIA/NeMo-Retriever/blob/main/docs/docs/extraction/prerequisites-support-matrix.md#model-hardware-requirements) table for per-NIM GPU and disk costs.
 
-The chart auto-wires the operator-managed in-cluster URLs of the three
-"core" NIMs into the service's `nim_endpoints` block:
+The chart auto-wires the operator-managed in-cluster URLs of the four
+core NIMs into the service's `nim_endpoints` block:
 
 | key | operator-managed Service | invoke path |
 | --- | ------------------------ | ----------- |
@@ -322,7 +321,7 @@ The retriever service picks up the in-cluster ASR endpoint when `nimOperator.aud
 | `serviceConfig.pipeline.realtimeWorkers`          | `24`    | Per-pod realtime worker count. |
 | `serviceConfig.pipeline.batchWorkers`             | `48`    | Per-pod batch worker count. Refer to [Timeouts and alleviating ingest failures](#timeouts-and-alleviating-ingest-failures) if embed or pool errors appear under load. |
 | `serviceConfig.resources.maxUploadBytes`          | `500000000` | Maximum upload file size in bytes; requests exceeding the limit are rejected before buffering. |
-| `serviceConfig.nimEndpoints.*InvokeUrl`           | `""`    | Override the auto-resolved NIM Operator URL. Available knobs: `pageElementsInvokeUrl`, `tableStructureInvokeUrl`, `ocrInvokeUrl`, `embedInvokeUrl`, and `captionInvokeUrl` (refer to [Image captioning (Omni 30B)](#image-captioning-omni-30b)). |
+| `serviceConfig.nimEndpoints.*InvokeUrl`           | `""`    | Override the auto-resolved NIM URL. `ocrInvokeUrl` is primary; `lineDetectorInvokeUrl` plus `ocrRecognizerInvokeUrl` are an optional split fallback. |
 | `serviceConfig.nimEndpoints.captionModelName`     | `""`    | Model id sent to the remote VLM. Auto-set to `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` whenever a caption URL is resolved. |
 | `serviceConfig.llm.enabled`                         | `false` | Enables `POST /v1/answer`. Auto-flips to true when `nimOperator.answer_llm` is enabled and the operator URL resolves. |
 | `serviceConfig.llm.apiBase`                         | `""`    | OpenAI-compatible LLM base URL. Explicit value wins; otherwise `answer_llm` opt-in resolves to `http://answer-llm:8000/v1` by default. |
@@ -469,8 +468,6 @@ gated on three conditions ALL holding:
 | `nimOperator.page_elements.enabled` | `true` | Page Elements 2.0 service; auto-wired to `/v1/page-elements`. |
 | `nimOperator.table_structure.enabled` | `true` | Table Structure 2.0 service; auto-wired to `/v1/table-structure`. |
 | `nimOperator.<page_elements|table_structure>.image` | `nvcr.io/nim/nvidia/nemotron-object-detection:2.0.0` | Both services use the combined image but select distinct models. |
-| `nimOperator.ocr.enabled`              | `true`  | OCR NIM. |
-| `nimOperator.ocr.image`              | `nvcr.io/nim/nvidia/nemotron-ocr-v2:2.0.0` | Default OCR NIM image. |
 | `nimOperator.vlm_embed.enabled`        | `true`  | Multimodal embedding NIM (also used by the vectordb Pod). |
 | `nimOperator.vlm_embed.nimServiceName` | `llama-nemotron-embed-vl-1b-v2` | NIMService / in-cluster DNS name. |
 | `nimOperator.vlm_embed.image`          | `nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0` | Default VLM embed NIM image. |
@@ -709,18 +706,11 @@ To pin a non-default GPU count chart-wide, set `nimServiceGpuLimit: 2`
 
 ### OCR NIM configuration { #ocr-nim-configuration }
 
-The core OCR NIM is configured under [`nimOperator.ocr`](./values.yaml) (the `ocr:`
-block). Confirm `image.repository` and `image.tag` before you upgrade.
-
-| Path | Role |
-|------|------|
-| `nimOperator.nimCache.keepOnUninstall` | When `true`, NIMCache CRs survive `helm uninstall` (`helm.sh/resource-policy: keep`). NIMService CRs are always removed. Set `false` for dev clusters that should fully tear down on uninstall. |
-| `nimOperator.ocr.enabled` | Reconcile the OCR `NIMService` |
-| `nimOperator.ocr.image.repository` | NIM image (default `nvcr.io/nim/nvidia/nemotron-ocr-v2`) |
-| `nimOperator.ocr.image.tag` | Pin the image tag for reproducible upgrades |
-
-Override the auto-wired in-cluster URL with `serviceConfig.nimEndpoints.ocrInvokeUrl`
-when the OCR service runs outside the operator sub-stack.
+The primary OCR NIM is configured under `nimOperator.ocr`; the chart creates
+and auto-wires `nemotron-ocr-v2`. Override it with
+`serviceConfig.nimEndpoints.ocrInvokeUrl` for an external deployment. The split
+PP-OCRv6 detector/recognizer fields are used only when that integrated URL is
+empty.
 
 ### Persistence
 

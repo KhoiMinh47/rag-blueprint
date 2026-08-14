@@ -513,6 +513,7 @@ class ExtractParams(_ParamsModel):
     extract_tables: bool = True
     extract_charts: bool = True
     extract_infographics: bool = False
+    extract_stamps: bool = True
     extract_page_as_image: Optional[bool] = True
 
     # Extraction options
@@ -529,19 +530,59 @@ class ExtractParams(_ParamsModel):
     inference_batch_size: int = 8
     ocr_model_dir: Optional[str] = None
     ocr_version: Literal["v1", "v2"] = "v2"
-    ocr_lang: Optional[Literal["multi", "english"]] = None
+    ocr_lang: Optional[Literal["multi", "english", "vietnamese"]] = None
+    # Request-scoped OCR selector.  ``None`` preserves the startup/default
+    # graph; the two opt-in values are wired only by the service worker.
+    ocr_pipeline: Optional[
+        Literal[
+            "pipeline-nemotron-ocr",
+            "pipeline-ppocrv6",
+            "pipeline-tesseract",
+            "pipeline-option3",
+            "pipeline-option4",
+            "pipeline-option5",
+            "pipeline-option6",
+            "pipeline-option7",
+        ]
+    ] = None
+
+    # Additive scan OCR recall layer.  The existing Page Elements/OCR path
+    # remains the primary path; these options only control full-page/tiled
+    # OCR for pages marked as requiring OCR.
+    scan_ocr_fallback: bool = True
+    scan_ocr_preprocess: bool = True
+    scan_ocr_tile_size: int = Field(default=1024, ge=256, le=4096)
+    scan_ocr_tile_overlap: float = Field(default=0.15, ge=0.0, lt=0.5)
+    scan_ocr_min_quality: float = Field(default=0.45, ge=0.0, le=1.0)
+    scan_ocr_max_retries: int = Field(default=1, ge=0, le=3)
 
     # Service endpoints
     invoke_url: Optional[str] = None
     api_key: Optional[str] = None
     request_timeout_s: float = 60.0
+    # Legacy endpoint retained for old direct callers. The service-owned
+    # Option 2 selector now uses page detection plus language-routed OCR.
+    official_ppocr_invoke_url: Optional[str] = None
+    # Legacy field retained for old clients/configs; Option 2 no longer uses
+    # the PaddleOCR-VL experiment.
+    paddleocr_vl_invoke_url: Optional[str] = None
     page_elements_invoke_url: Optional[str] = None
     page_elements_api_key: Optional[str] = None
     page_elements_request_timeout_s: Optional[float] = None
     ocr_invoke_url: Optional[str] = None
+    line_detector_invoke_url: Optional[str] = None
+    ocr_recognizer_invoke_url: Optional[str] = None
+    tesseract_ocr_invoke_url: Optional[str] = None
+    vintern_ocr_invoke_url: Optional[str] = None
+    # Pipeline 7 only: OpenAI-compatible Ministral 3B VLM OCR endpoint.
+    ministral_vlm_invoke_url: Optional[str] = None
+    # Option 3 only: server-owned Vietnamese recognizer (VietOCR by default).
+    vietnamese_ocr_invoke_url: Optional[str] = None
     ocr_api_key: Optional[str] = None
     ocr_request_timeout_s: Optional[float] = None
     table_structure_invoke_url: Optional[str] = None
+    stamp_detection_invoke_url: Optional[str] = None
+    stamp_detection_min_score: float = 0.50
     nemotron_parse_invoke_url: Optional[str] = None
     nemotron_parse_model: Optional[str] = None
 
@@ -564,10 +605,10 @@ class ExtractParams(_ParamsModel):
         """
         if self.table_structure_invoke_url and not self.use_table_structure:
             self.use_table_structure = True
-        if self.table_output_format is None:
-            self.table_output_format = "markdown" if self.use_table_structure else "pseudo_markdown"
         if self.ocr_version == "v1" and self.ocr_lang is not None:
             raise ValueError("ocr_lang is only supported when ocr_version='v2'.")
+        if self.table_output_format is None:
+            self.table_output_format = "markdown" if self.use_table_structure else "pseudo_markdown"
         if self.method != "nemotron_parse" and (
             self.nemotron_parse_invoke_url is not None or self.nemotron_parse_model is not None
         ):

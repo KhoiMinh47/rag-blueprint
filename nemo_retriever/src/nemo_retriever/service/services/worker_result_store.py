@@ -40,11 +40,13 @@ logger = logging.getLogger(__name__)
 _lock = threading.Lock()
 _filesystem_lock = threading.Lock()
 _store: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_visual_store: dict[str, tuple[float, dict[str, Any]]] = {}
 _RESULTS_DIR_ENV = "NEMO_RETRIEVER_RESULTS_DIR"
 _RESULTS_TTL_S_ENV = "NEMO_RETRIEVER_RESULTS_TTL_SECONDS"
 _DEFAULT_RESULTS_TTL_S = 8 * 3600  # stale-job window plus terminal-job retention
 _SWEEP_INTERVAL_S = 60
 _STORE_NAMESPACE = ".worker-results-v1"
+_VISUAL_STORE_NAMESPACE = ".worker-visual-v1"
 _last_sweep_dir: Path | None = None
 _last_sweep_at = 0.0
 
@@ -65,6 +67,10 @@ def is_shared_result_store_configured() -> bool:
 
 def _results_root(results_dir: Path) -> Path:
     return results_dir / _STORE_NAMESPACE
+
+
+def _visual_results_root(results_dir: Path) -> Path:
+    return results_dir / _VISUAL_STORE_NAMESPACE
 
 
 def _fsync_directory(path: Path) -> None:
@@ -96,6 +102,14 @@ def _ensure_results_root(results_dir: Path) -> Path:
     return root
 
 
+def _ensure_visual_root(results_dir: Path) -> Path:
+    if not results_dir.is_dir():
+        raise OSError(f"Shared result directory {results_dir} does not exist or is not a directory")
+    root = _visual_results_root(results_dir)
+    _mkdir_and_fsync_parent(root)
+    return root
+
+
 def _document_digest(document_id: str) -> str:
     return hashlib.sha256(document_id.encode("utf-8")).hexdigest()
 
@@ -103,6 +117,11 @@ def _document_digest(document_id: str) -> str:
 def _document_dir(results_dir: Path, document_id: str) -> Path:
     """Return a traversal-safe directory for *document_id*."""
     return _results_root(results_dir) / _document_digest(document_id)
+
+
+def _visual_document_dir(results_dir: Path, document_id: str) -> Path:
+    """Return the traversal-safe directory for visual evidence."""
+    return _visual_results_root(results_dir) / _document_digest(document_id)
 
 
 def _is_hex(value: str, length: int) -> bool:
@@ -115,6 +134,13 @@ def _is_document_dir(path: Path) -> bool:
 
 def _is_generation(path: Path) -> bool:
     return path.name.endswith(".json") and _is_hex(path.name.removesuffix(".json"), 32)
+
+
+def _is_visual_generation(path: Path) -> bool:
+    name = path.name
+    if not (name.startswith("visual-") and name.endswith(".json")):
+        return False
+    return _is_hex(name.removeprefix("visual-").removesuffix(".json"), 32)
 
 
 def _is_temporary(path: Path) -> bool:
@@ -244,6 +270,39 @@ def _sweep_expired_files(results_dir: Path, *, now: float, ttl_s: float) -> None
         logger.info("Removed %d expired shared result file(s) from %s", removed, root)
 
 
+def _sweep_expired_visual_files(results_dir: Path, *, now: float, ttl_s: float) -> None:
+    """Best-effort TTL cleanup for dashboard visual evidence generations."""
+    root = _visual_results_root(results_dir)
+    try:
+        document_dirs = list(root.iterdir())
+    except FileNotFoundError:
+        return
+    except OSError:
+        logger.warning("Unable to scan shared visual evidence directory %s", root, exc_info=True)
+        return
+
+    cutoff = now - ttl_s
+    removed = 0
+    for document_dir in document_dirs:
+        if not _is_document_dir(document_dir):
+            continue
+        try:
+            paths = list(document_dir.iterdir())
+        except FileNotFoundError:
+            continue
+        except OSError:
+            logger.debug("Unable to scan visual evidence document directory %s", document_dir, exc_info=True)
+            continue
+        removed += sum(_remove_expired_file(path, cutoff=cutoff) for path in paths if _is_visual_generation(path))
+        try:
+            if document_dir.stat().st_mtime <= cutoff:
+                document_dir.rmdir()
+        except OSError:
+            pass
+    if removed:
+        logger.info("Removed %d expired visual evidence file(s) from %s", removed, root)
+
+
 def _maybe_sweep_expired_files(results_dir: Path) -> None:
     """Sweep at most once per interval in this process; other pods may also sweep."""
     global _last_sweep_at, _last_sweep_dir
@@ -255,6 +314,7 @@ def _maybe_sweep_expired_files(results_dir: Path) -> None:
         _last_sweep_dir = results_dir
         _last_sweep_at = monotonic_now
     _sweep_expired_files(results_dir, now=time.time(), ttl_s=_results_ttl_s())
+    _sweep_expired_visual_files(results_dir, now=time.time(), ttl_s=_results_ttl_s())
 
 
 def _store_on_filesystem(results_dir: Path, document_id: str, result_data: list[dict[str, Any]]) -> None:
@@ -321,11 +381,77 @@ def _get_from_filesystem(results_dir: Path, document_id: str) -> list[dict[str, 
     return None
 
 
+def _store_visual_on_filesystem(results_dir: Path, document_id: str, evidence: dict[str, Any]) -> None:
+    _maybe_sweep_expired_files(results_dir)
+    with _filesystem_lock:
+        root = _ensure_visual_root(results_dir)
+        document_dir = _visual_document_dir(results_dir, document_id)
+        _mkdir_and_fsync_parent(document_dir)
+    generation_id = uuid.uuid4().hex
+    temporary = document_dir / f".{generation_id}.tmp"
+    target = document_dir / f"visual-{generation_id}.json"
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(evidence, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        _fsync_directory(document_dir)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Unable to remove interrupted visual evidence write %s", temporary, exc_info=True)
+
+
+def _visual_generation_candidates(document_dir: Path, document_id: str) -> list[Path]:
+    try:
+        paths = list(document_dir.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise ResultStoreTemporarilyUnavailable(f"Unable to scan visual evidence for {document_id!r}") from exc
+
+    candidates: list[tuple[int, str, Path]] = []
+    for path in paths:
+        if not _is_visual_generation(path):
+            continue
+        try:
+            candidates.append((path.stat().st_mtime_ns, path.name, path))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ResultStoreTemporarilyUnavailable(f"Unable to inspect visual evidence for {document_id!r}") from exc
+    candidates.sort(reverse=True)
+    return [path for _, _, path in candidates]
+
+
+def _get_visual_from_filesystem(results_dir: Path, document_id: str) -> dict[str, Any] | None:
+    _maybe_sweep_expired_files(results_dir)
+    candidates = _visual_generation_candidates(_visual_document_dir(results_dir, document_id), document_id)
+    for candidate in candidates:
+        try:
+            with candidate.open(encoding="utf-8") as stream:
+                evidence = json.load(stream)
+        except FileNotFoundError:
+            continue
+        except (ValueError, OSError) as exc:
+            logger.warning("Unable to read visual evidence for %r", document_id, exc_info=True)
+            raise ResultStoreTemporarilyUnavailable(f"Unable to read visual evidence for {document_id!r}") from exc
+        if not isinstance(evidence, dict):
+            raise ResultStoreTemporarilyUnavailable(f"Invalid visual evidence payload for {document_id!r}")
+        return evidence
+    return None
+
+
 def _sweep_memory_locked(*, now: float) -> None:
     cutoff = now - _results_ttl_s()
     for document_id, (stored_at, _) in list(_store.items()):
         if stored_at <= cutoff:
             _store.pop(document_id, None)
+    for document_id, (stored_at, _) in list(_visual_store.items()):
+        if stored_at <= cutoff:
+            _visual_store.pop(document_id, None)
 
 
 def store_result_data(document_id: str, result_data: list[dict[str, Any]] | None) -> None:
@@ -351,6 +477,37 @@ def get_result_data(document_id: str) -> list[dict[str, Any]] | None:
         return copy.deepcopy(entry[1]) if entry is not None else None
 
 
+def store_visual_evidence(document_id: str, evidence: dict[str, Any] | None) -> None:
+    """Retain compact page images and geometry for dashboard inspection."""
+    if not document_id or not evidence:
+        return
+    if results_dir := _results_dir():
+        _store_visual_on_filesystem(results_dir, document_id, evidence)
+        return
+    with _lock:
+        now = time.monotonic()
+        _sweep_memory_locked(now=now)
+        _visual_store[document_id] = (now, copy.deepcopy(evidence))
+
+
+def get_visual_evidence(document_id: str) -> dict[str, Any] | None:
+    """Return compact dashboard visual evidence without consuming it."""
+    if results_dir := _results_dir():
+        return _get_visual_from_filesystem(results_dir, document_id)
+    with _lock:
+        _sweep_memory_locked(now=time.monotonic())
+        entry = _visual_store.get(document_id)
+        return copy.deepcopy(entry[1]) if entry is not None else None
+
+
+def discard_local_visual_evidence(document_id: str) -> None:
+    """Discard worker-local visual evidence after gateway acknowledgement."""
+    if _results_dir() is not None:
+        return
+    with _lock:
+        _visual_store.pop(document_id, None)
+
+
 def discard_local_result_data(document_id: str) -> None:
     """Discard an acknowledged worker-local result payload.
 
@@ -365,10 +522,58 @@ def discard_local_result_data(document_id: str) -> None:
         _store.pop(document_id, None)
 
 
+def delete_result_data(document_id: str) -> None:
+    """Delete retained result rows for one document immediately.
+
+    Unlike :func:`discard_local_result_data`, this also removes the exact
+    immutable generations from the configured shared result directory. The
+    caller must already have resolved the document as belonging to the job
+    being deleted; this function only receives one opaque document id.
+    """
+    if not document_id:
+        return
+    if results_dir := _results_dir():
+        with _filesystem_lock:
+            for document_dir, predicate, label in (
+                (_document_dir(results_dir, document_id), lambda path: _is_generation(path) or _is_temporary(path), "result"),
+                (_visual_document_dir(results_dir, document_id), _is_visual_generation, "visual evidence"),
+            ):
+                try:
+                    children = list(document_dir.iterdir())
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise ResultStoreTemporarilyUnavailable(
+                        f"Unable to inspect retained {label} for {document_id!r}"
+                    ) from exc
+                for child in children:
+                    if not predicate(child):
+                        continue
+                    try:
+                        child.unlink(missing_ok=True)
+                    except OSError as exc:
+                        raise ResultStoreTemporarilyUnavailable(
+                            f"Unable to delete retained {label} for {document_id!r}"
+                        ) from exc
+                try:
+                    document_dir.rmdir()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise ResultStoreTemporarilyUnavailable(
+                        f"Unable to remove retained {label} directory for {document_id!r}"
+                    ) from exc
+        return
+    with _lock:
+        _store.pop(document_id, None)
+        _visual_store.pop(document_id, None)
+
+
 def clear_for_tests() -> None:
     """Test helper — drop all cached rows and sweep timestamps."""
     global _last_sweep_at, _last_sweep_dir
     with _lock:
         _store.clear()
+        _visual_store.clear()
         _last_sweep_dir = None
         _last_sweep_at = 0.0

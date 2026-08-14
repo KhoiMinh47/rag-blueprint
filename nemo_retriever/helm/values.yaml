@@ -544,6 +544,16 @@ serviceConfig:
     pageElementsInvokeUrl: ""
     tableStructureInvokeUrl: ""
     ocrInvokeUrl: ""
+    # Pipeline 7: external/OpenAI-compatible Ministral 3B VLM OCR endpoint.
+    ministralVlmInvokeUrl: ""
+    # Option 3 only. Point this at the server-owned VietOCR service (or a
+    # compatible Vietnamese recognizer); it is never used by Options 1, 2, or 4.
+    vietnameseOcrInvokeUrl: ""
+    # Optional split OCR fallback. It is used only when ocrInvokeUrl is empty.
+    lineDetectorInvokeUrl: ""
+    ocrRecognizerInvokeUrl: ""
+    # Optional CPU Tesseract 5 recognizer used by pipeline-tesseract.
+    tesseractOcrInvokeUrl: ""
     embedInvokeUrl: ""
     # Optional remote VLM endpoint for image captioning (Nemotron 3 Nano
     # Omni). Auto-wired from the in-cluster Service when
@@ -976,7 +986,7 @@ nimOperator:
   #   Core (enabled: true by default, auto-wired into the service config):
   #     - page_elements
   #     - table_structure
-  #     - ocr
+  #     - ocr (Nemotron OCR v2; PP-OCRv6 remains an external fallback)
   #     - vlm_embed
   #
   #   Optional (enabled: false by default, NOT auto-wired):
@@ -1121,7 +1131,7 @@ nimOperator:
       - name: NIM_ENGINE_MODEL_PATH
         value: /model-store/table-structure
 
-  # Nemotron OCR v2. Used by the OCR stage of the pipeline.
+  # Nemotron OCR v2. Primary detect + recognize backend for document OCR.
   ocr:
     enabled: true
     # nimService: direct PVC + startup download; nimCache: legacy cache job.

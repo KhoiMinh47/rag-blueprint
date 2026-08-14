@@ -52,10 +52,19 @@ _DENYLIST_KEY_SUBSTRINGS: tuple[str, ...] = (
     "storage_uri",
     "vectordb_url",
     "embed_invoke_url",
+    # Keep the generic invoke_url guard explicit in the public policy
+    # description as well.  Clients and the dashboard use this exact key
+    # when explaining why the server-owned Nemotron endpoint cannot be
+    # overridden per request.
+    "ocr_invoke_url",
     "embedding_endpoint",
     "page_elements_invoke_url",
-    "ocr_invoke_url",
+    "line_detector_invoke_url",
+    "ocr_recognizer_invoke_url",
+    "ministral_vlm_invoke_url",
+    "tesseract_ocr_invoke_url",
     "table_structure_invoke_url",
+    "stamp_detection_invoke_url",
     "nemotron_parse_invoke_url",
     "profile_name",
 )
@@ -78,6 +87,7 @@ _DEFAULT_ALLOWED_EXTRACT_KEYS: frozenset[str] = frozenset(
         "extract_tables",
         "extract_charts",
         "extract_infographics",
+        "extract_stamps",
         "extract_page_as_image",
         "method",
         "use_page_elements",
@@ -89,6 +99,7 @@ _DEFAULT_ALLOWED_EXTRACT_KEYS: frozenset[str] = frozenset(
         "render_mode",
         "inference_batch_size",
         "ocr_version",
+        "ocr_lang",
         "output_column",
         "num_detections_column",
         "counts_by_label_column",

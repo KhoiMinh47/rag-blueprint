@@ -124,6 +124,8 @@ async def _fire_gateway_callback(
     result_rows: int = 0,
     error: str | None = None,
     result_worker_ip: str | None = None,
+    visual_worker_ip: str | None = None,
+    pipeline_diagnostics: Mapping[str, Any] | None = None,
     callback_headers: Mapping[str, str] | None = None,
     retry_after_cap_s: float = _CALLBACK_RETRY_DELAYS_S[-1],
     lease_id: str | None = None,
@@ -146,6 +148,10 @@ async def _fire_gateway_callback(
         payload["error"] = error
     if result_worker_ip:
         payload["result_worker_ip"] = result_worker_ip
+    if visual_worker_ip:
+        payload["visual_worker_ip"] = visual_worker_ip
+    if pipeline_diagnostics:
+        payload["pipeline_diagnostics"] = dict(pipeline_diagnostics)
     if lease_id is not None:
         payload["lease_id"] = lease_id
         payload["lease_generation"] = lease_generation
@@ -329,8 +335,11 @@ class _Pool:
         result_rows: int = 0,
         error: str | None = None,
         result_worker_ip: str | None = None,
+        visual_worker_ip: str | None = None,
+        pipeline_diagnostics: Mapping[str, Any] | None = None,
         callback_headers: Mapping[str, str] | None = None,
         retain_results: bool = False,
+        retain_visual: bool = False,
         work_item: WorkItem | None = None,
     ) -> None:
         """Continue callback delivery with bounded, backpressured concurrency."""
@@ -353,8 +362,11 @@ class _Pool:
                 result_rows=result_rows,
                 error=error,
                 result_worker_ip=result_worker_ip,
+                visual_worker_ip=visual_worker_ip,
+                pipeline_diagnostics=pipeline_diagnostics,
                 callback_headers=callback_headers,
                 retain_results=retain_results,
+                retain_visual=retain_visual,
                 work_item=work_item,
             )
         )
@@ -395,12 +407,16 @@ class _Pool:
         result_rows: int,
         error: str | None,
         result_worker_ip: str | None,
+        visual_worker_ip: str | None,
+        pipeline_diagnostics: Mapping[str, Any] | None,
         callback_headers: Mapping[str, str] | None,
         retain_results: bool,
+        retain_visual: bool,
         work_item: WorkItem | None,
     ) -> None:
         from nemo_retriever.service.services.worker_result_store import (
             discard_local_result_data,
+            discard_local_visual_evidence,
             result_retention_seconds,
         )
 
@@ -418,6 +434,8 @@ class _Pool:
                 result_rows=result_rows,
                 error=error,
                 result_worker_ip=result_worker_ip,
+                visual_worker_ip=visual_worker_ip,
+                pipeline_diagnostics=pipeline_diagnostics,
                 callback_headers=callback_headers,
                 retry_after_cap_s=_CALLBACK_DEFERRED_MAX_DELAY_S,
                 lease_id=work_item.lease_id if work_item is not None else None,
@@ -428,6 +446,8 @@ class _Pool:
                     POOL_COMPLETED_CLAIMS.labels(pool=self._name).inc()
                 if retain_results:
                     discard_local_result_data(item_id)
+                if retain_visual:
+                    discard_local_visual_evidence(item_id)
                 logger.info("Deferred gateway callback succeeded for item %s", item_id)
                 return
             if delivery_outcome == _CallbackDeliveryOutcome.PERMANENT_FAILURE:
@@ -516,12 +536,18 @@ class _Pool:
                         tracker.mark_processing(item.id)
                     result_rows = 0
                     result_data = None
+                    pipeline_diagnostics = None
+                    visual_evidence = None
                     if self._work_fn is not None:
                         result = self._work_fn(item)
                         if asyncio.iscoroutine(result):
                             result = await result
-                        if isinstance(result, tuple) and len(result) == 2:
+                        if isinstance(result, tuple) and len(result) >= 2:
                             result_rows, result_data = result
+                            visual_evidence = getattr(result_data, "visual_evidence", None)
+                            pipeline_diagnostics = getattr(result_data, "pipeline_diagnostics", None)
+                            if len(result) >= 3 and isinstance(result[2], Mapping):
+                                pipeline_diagnostics = dict(result[2])
                         elif isinstance(result, int):
                             result_rows = result
 
@@ -531,6 +557,8 @@ class _Pool:
                         if tracker_lookup is not None:
                             retain_results = tracker_lookup.should_retain_results(item.job_id)
 
+                    has_visual_evidence = isinstance(visual_evidence, dict) and bool(visual_evidence)
+
                     if item.callback_url:
                         if retain_results:
                             from nemo_retriever.service.services.worker_result_store import (
@@ -538,12 +566,20 @@ class _Pool:
                             )
 
                             store_result_data(item.id, result_data)
+                        if has_visual_evidence:
+                            from nemo_retriever.service.services.worker_result_store import (
+                                store_visual_evidence,
+                            )
+
+                            store_visual_evidence(item.id, visual_evidence)
                         callback_outcome = await _fire_gateway_callback(
                             item.callback_url,
                             item.id,
                             "completed",
                             result_rows=result_rows,
                             result_worker_ip=(os.environ.get("POD_IP") if retain_results and result_rows > 0 else None),
+                            visual_worker_ip=(os.environ.get("POD_IP") if has_visual_evidence else None),
+                            pipeline_diagnostics=pipeline_diagnostics,
                             callback_headers=item.callback_headers,
                             lease_id=item.lease_id,
                             lease_generation=item.lease_generation,
@@ -557,6 +593,12 @@ class _Pool:
                                 )
 
                                 discard_local_result_data(item.id)
+                            if has_visual_evidence:
+                                from nemo_retriever.service.services.worker_result_store import (
+                                    discard_local_visual_evidence,
+                                )
+
+                                discard_local_visual_evidence(item.id)
                         elif callback_outcome == _CallbackDeliveryOutcome.RETRYABLE:
                             await self._schedule_gateway_callback_retry(
                                 callback_url=item.callback_url,
@@ -566,15 +608,25 @@ class _Pool:
                                 result_worker_ip=(
                                     os.environ.get("POD_IP") if retain_results and result_rows > 0 else None
                                 ),
+                                visual_worker_ip=(os.environ.get("POD_IP") if has_visual_evidence else None),
+                                pipeline_diagnostics=pipeline_diagnostics,
                                 callback_headers=item.callback_headers,
                                 retain_results=retain_results,
+                                retain_visual=has_visual_evidence,
                                 work_item=item,
                             )
                     elif tracker is not None:
+                        if has_visual_evidence:
+                            from nemo_retriever.service.services.worker_result_store import (
+                                store_visual_evidence,
+                            )
+
+                            store_visual_evidence(item.id, visual_evidence)
                         tracker.mark_completed(
                             item.id,
                             result_rows=result_rows,
                             result_data=result_data if retain_results else None,
+                            pipeline_diagnostics=pipeline_diagnostics,
                         )
                     self._processed += 1
                 except Exception as exc:

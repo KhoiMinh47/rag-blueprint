@@ -73,6 +73,11 @@ nim_endpoints:
   page_elements_invoke_url: {{ .pageElementsURL | quote }}
   table_structure_invoke_url: {{ .tableStructureURL | quote }}
   ocr_invoke_url: {{ .ocrURL | quote }}
+  ministral_vlm_invoke_url: {{ .Values.serviceConfig.nimEndpoints.ministralVlmInvokeUrl | quote }}
+  vietnamese_ocr_invoke_url: {{ .Values.serviceConfig.nimEndpoints.vietnameseOcrInvokeUrl | quote }}
+  line_detector_invoke_url: {{ .Values.serviceConfig.nimEndpoints.lineDetectorInvokeUrl | quote }}
+  ocr_recognizer_invoke_url: {{ .Values.serviceConfig.nimEndpoints.ocrRecognizerInvokeUrl | quote }}
+  tesseract_ocr_invoke_url: {{ .Values.serviceConfig.nimEndpoints.tesseractOcrInvokeUrl | quote }}
   embed_invoke_url: {{ .embedURL | quote }}
   embed_model_name: {{ .Values.serviceConfig.vectordb.embedModel | quote }}
 {{- if .Values.serviceConfig.vectordb.embedModelProviderPrefix }}

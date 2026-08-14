@@ -17,5 +17,5 @@ def test_multi_type_grouping_against_repo_data_folder() -> None:
 
     grouped = extract_op.preprocess(str(data_folder))
 
-    assert set(grouped) == {"pdf", "image", "text", "html", "audio", "video"}
+    assert set(grouped) == {"pdf", "image", "text", "html", "spreadsheet", "audio", "video"}
     assert any(files for files in grouped.values()), f"No supported files were found in {data_folder}"

@@ -43,7 +43,9 @@ from nemo_retriever.operators.extract.pdf.extract import PDFExtractionActor
 from nemo_retriever.operators.extract.pdf.split import PDFSplitActor
 from nemo_retriever.operators.extract.table.table_detection import TableStructureActor
 from nemo_retriever.operators.extract.txt.ray_data import TextChunkCPUActor, TxtSplitActor
+from nemo_retriever.operators.extract.spreadsheet.ray_data import SpreadsheetExtractActor
 from nemo_retriever.common.modality.convert.to_pdf import DocToPdfConversionActor
+from nemo_retriever.common.modality.content_transforms import chunk_pdf_content_rows, clean_content_rows
 from nemo_retriever.operators.extract.video.audio_visual_fuser import AudioVisualFuser
 from nemo_retriever.operators.extract.video.frame_actor import VideoFrameActor
 from nemo_retriever.operators.extract.video.ocr_actor import VideoFrameOCRActor
@@ -53,6 +55,20 @@ from nemo_retriever.operators.extract.video.split import video_asr_audio_chunk_p
 from nemo_retriever.graph.designer import designer_component
 from nemo_retriever.common.input_files import INPUT_TYPE_EXTENSIONS
 from nemo_retriever.common import ray_resource_hueristics as _rrh
+from nemo_retriever.common.modality.ocr.isolated.option5 import (
+    OPTION5_DETECTOR_BATCH_SIZE,
+    OPTION5_MAX_REQUEST_WORKERS,
+    OPTION5_OCR_BATCH_SIZE,
+)
+from nemo_retriever.common.modality.ocr.isolated.option6 import (
+    OPTION6_DETECTOR_BATCH_SIZE,
+    OPTION6_MAX_REQUEST_WORKERS,
+    OPTION6_VLM_BATCH_SIZE,
+)
+from nemo_retriever.common.modality.ocr.isolated.option7 import (
+    OPTION7_DETECTOR_BATCH_SIZE,
+    OPTION7_OCR_BATCH_SIZE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +79,7 @@ HTML_EXTENSIONS = INPUT_TYPE_EXTENSIONS["html"]
 AUDIO_EXTENSIONS = INPUT_TYPE_EXTENSIONS["audio"]
 IMAGE_EXTENSIONS = INPUT_TYPE_EXTENSIONS["image"]
 VIDEO_EXTENSIONS = INPUT_TYPE_EXTENSIONS["video"]
+SPREADSHEET_EXTENSIONS = INPUT_TYPE_EXTENSIONS["spreadsheet"]
 DEFAULT_AUDIO_SPLIT_INTERVAL = 500000
 DEFAULT_VIDEO_FRAME_FPS = 0.5
 
@@ -114,6 +131,12 @@ def _ocr_stage_needed(extract_params: ExtractParams) -> bool:
         return True
     if extract_params.extract_infographics:
         return True
+    if extract_params.extract_images:
+        # Visual crops must pass through the OCR operator too; image-only
+        # pages otherwise stop after PDFium's raster extraction.
+        return True
+    if extract_params.extract_stamps and _has_endpoint(extract_params.stamp_detection_invoke_url):
+        return True
     return False
 
 
@@ -126,6 +149,31 @@ def _extract_params_need_local_gpu(extraction_mode: str, extract_params: Extract
     if _parse_mode_enabled(extract_params):
         return not _has_endpoint(extract_params.nemotron_parse_invoke_url, extract_params.invoke_url)
 
+    # Option 2 is fully remote: Page Elements/Table Structure, Nemotron OCR,
+    # and VietOCR each own a service.
+    # Do not allocate a local Retriever OCR actor for this selector.
+    if (
+        getattr(extract_params, "ocr_pipeline", None) in {"pipeline-ppocrv6", "pipeline-tesseract"}
+        and _has_endpoint(
+            getattr(extract_params, "ocr_invoke_url", None),
+            getattr(extract_params, "vietnamese_ocr_invoke_url", None),
+        )
+    ):
+        return False
+
+    if (
+        getattr(extract_params, "ocr_pipeline", None) == "pipeline-option6"
+        and _has_endpoint(getattr(extract_params, "vintern_ocr_invoke_url", None))
+        and _has_endpoint(extract_params.page_elements_invoke_url)
+    ):
+        return False
+
+    if (
+        getattr(extract_params, "ocr_pipeline", None) == "pipeline-option7"
+        and _has_endpoint(getattr(extract_params, "ministral_vlm_invoke_url", None))
+    ):
+        return False
+
     if not _has_endpoint(extract_params.page_elements_invoke_url):
         return True
     if (
@@ -134,8 +182,13 @@ def _extract_params_need_local_gpu(extraction_mode: str, extract_params: Extract
         and not _has_endpoint(extract_params.table_structure_invoke_url)
     ):
         return True
-    if _ocr_stage_needed(extract_params) and not _has_endpoint(extract_params.ocr_invoke_url):
-        return True
+    if _ocr_stage_needed(extract_params):
+        legacy_remote = _has_endpoint(extract_params.ocr_invoke_url)
+        split_remote = _has_endpoint(extract_params.line_detector_invoke_url) and _has_endpoint(
+            extract_params.ocr_recognizer_invoke_url
+        )
+        if not (legacy_remote or split_remote):
+            return True
     return False
 
 
@@ -201,6 +254,9 @@ class _MultiTypeExtractBase(AbstractOperator):
         if not grouped["html"].empty:
             html_params = self._effective_chunk_params("html")
             outputs.append(HtmlSplitActor(params=html_params).run(grouped["html"]))
+        if not grouped["spreadsheet"].empty:
+            spreadsheet_params = self._effective_chunk_params("spreadsheet")
+            outputs.append(SpreadsheetExtractActor(params=spreadsheet_params).run(grouped["spreadsheet"]))
         if not grouped["audio"].empty:
             audio_work, audio_spill = self._materialize_media_bytes(grouped["audio"])
             try:
@@ -219,7 +275,15 @@ class _MultiTypeExtractBase(AbstractOperator):
         return pd.concat(non_empty, ignore_index=True, sort=False)
 
     def _group_batches(self, batch_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-        grouped: dict[str, list[int]] = {"pdf": [], "image": [], "text": [], "html": [], "audio": [], "video": []}
+        grouped: dict[str, list[int]] = {
+            "pdf": [],
+            "image": [],
+            "text": [],
+            "html": [],
+            "spreadsheet": [],
+            "audio": [],
+            "video": [],
+        }
         explicit_mode = self.extraction_mode
 
         for idx, row in batch_df.iterrows():
@@ -257,6 +321,8 @@ class _MultiTypeExtractBase(AbstractOperator):
             return "text"
         if ext in HTML_EXTENSIONS:
             return "html"
+        if ext in SPREADSHEET_EXTENSIONS:
+            return "spreadsheet"
         if ext in AUDIO_EXTENSIONS:
             return "audio"
         if ext in VIDEO_EXTENSIONS:
@@ -264,7 +330,15 @@ class _MultiTypeExtractBase(AbstractOperator):
         return ""
 
     def _group_file_inputs(self, data: Any) -> dict[str, list[str]]:
-        grouped: dict[str, list[str]] = {"pdf": [], "image": [], "text": [], "html": [], "audio": [], "video": []}
+        grouped: dict[str, list[str]] = {
+            "pdf": [],
+            "image": [],
+            "text": [],
+            "html": [],
+            "spreadsheet": [],
+            "audio": [],
+            "video": [],
+        }
 
         if isinstance(data, (str, os.PathLike)):
             path = Path(data)
@@ -336,6 +410,10 @@ class _MultiTypeExtractBase(AbstractOperator):
             }
             batch_df = PDFExtractionActor(**extract_kwargs).run(batch_df)
             batch_df = self._run_detection_pipeline(batch_df)
+        # Auto/mixed extraction also needs the same canonical native/OCR
+        # cleanup as the direct PDF graph.  Without this stage, PDFium text
+        # and OCR/table content can survive as duplicate page payloads.
+        batch_df = clean_content_rows(batch_df)
         return self._maybe_chunk(batch_df, "pdf")
 
     def _run_image_pipeline(self, batch_df: pd.DataFrame) -> pd.DataFrame:
@@ -354,6 +432,8 @@ class _MultiTypeExtractBase(AbstractOperator):
         return {
             "ocr_invoke_url": ep.ocr_invoke_url,
             "ocr_version": getattr(ep, "ocr_version", "v2"),
+            "line_detector_invoke_url": ep.line_detector_invoke_url,
+            "ocr_recognizer_invoke_url": ep.ocr_recognizer_invoke_url,
             "ocr_lang": getattr(ep, "ocr_lang", None),
             "api_key": ep.ocr_api_key or ep.api_key,
             "inference_batch_size": int(ep.inference_batch_size),
@@ -399,7 +479,7 @@ class _MultiTypeExtractBase(AbstractOperator):
 
         Branch B: ``VideoFrameActor`` extracts frames at
         ``video_frame_params.fps``; optional content-hash dedup;
-        ``VideoFrameOCRActor`` (Nemotron OCR) runs full-frame OCR
+        ``VideoFrameOCRActor`` is disabled in the document-only pipeline
         directly — no page-elements detection; ``VideoFrameTextDedup``
         then collapses time-adjacent runs of identical OCR text per
         ``source_path`` (mirrors the Ray graph in ``build_graph``).
@@ -456,6 +536,12 @@ class _MultiTypeExtractBase(AbstractOperator):
     def _run_detection_pipeline(self, batch_df: pd.DataFrame) -> pd.DataFrame:
         extract_params = self.extract_params
         tuning = getattr(extract_params, "batch_tuning", None)
+        option7_selected = getattr(extract_params, "ocr_pipeline", None) == "pipeline-option7"
+        document_batch_selected = getattr(extract_params, "ocr_pipeline", None) in {
+            "pipeline-option5",
+            "pipeline-option6",
+            "pipeline-option7",
+        }
         ocr_version = getattr(extract_params, "ocr_version", "v2")
         ocr_lang = getattr(extract_params, "ocr_lang", None)
 
@@ -469,28 +555,92 @@ class _MultiTypeExtractBase(AbstractOperator):
         )
         if inference_batch_size:
             detect_kwargs["inference_batch_size"] = int(inference_batch_size)
-        batch_df = self._instantiate_resolved(PageElementDetectionActor, **detect_kwargs).run(batch_df)
+        if document_batch_selected:
+            detect_kwargs["inference_batch_size"] = (
+                OPTION6_DETECTOR_BATCH_SIZE
+                if getattr(extract_params, "ocr_pipeline", None) == "pipeline-option6"
+                else (
+                    OPTION7_DETECTOR_BATCH_SIZE
+                    if getattr(extract_params, "ocr_pipeline", None) == "pipeline-option7"
+                    else OPTION5_DETECTOR_BATCH_SIZE
+                )
+            )
+            detect_kwargs["remote_max_pool_workers"] = (
+                OPTION6_MAX_REQUEST_WORKERS
+                if getattr(extract_params, "ocr_pipeline", None) == "pipeline-option6"
+                else OPTION5_MAX_REQUEST_WORKERS
+            )
+        # Restored Pipeline 7 uses Page Elements semantic text/title/visual
+        # boxes on every PDF page; scan pages additionally retain the
+        # full-page Ministral fallback.
+        if not option7_selected or extract_params.use_page_elements:
+            batch_df = self._instantiate_resolved(PageElementDetectionActor, **detect_kwargs).run(batch_df)
 
-        if extract_params.use_table_structure and extract_params.extract_tables:
+        stamp_needed = False
+
+        if (
+            extract_params.use_table_structure
+            and extract_params.extract_tables
+            and not option7_selected
+        ):
             table_kwargs: dict[str, Any] = {"ocr_version": ocr_version}
             if ocr_lang is not None:
                 table_kwargs["ocr_lang"] = ocr_lang
             if extract_params.table_structure_invoke_url:
                 table_kwargs["table_structure_invoke_url"] = extract_params.table_structure_invoke_url
-            if extract_params.ocr_invoke_url:
+            if extract_params.ocr_invoke_url and not option7_selected:
                 table_kwargs["ocr_invoke_url"] = extract_params.ocr_invoke_url
             if extract_params.api_key:
                 table_kwargs["api_key"] = extract_params.api_key
             if extract_params.table_output_format:
                 table_kwargs["table_output_format"] = extract_params.table_output_format
+            if document_batch_selected:
+                table_kwargs["inference_batch_size"] = (
+                    OPTION6_DETECTOR_BATCH_SIZE
+                    if getattr(extract_params, "ocr_pipeline", None) == "pipeline-option6"
+                    else (
+                        OPTION7_DETECTOR_BATCH_SIZE
+                        if getattr(extract_params, "ocr_pipeline", None) == "pipeline-option7"
+                        else OPTION5_DETECTOR_BATCH_SIZE
+                    )
+                )
+                table_kwargs["remote_max_pool_workers"] = (
+                    OPTION6_MAX_REQUEST_WORKERS
+                    if getattr(extract_params, "ocr_pipeline", None) == "pipeline-option6"
+                    else OPTION5_MAX_REQUEST_WORKERS
+                )
             batch_df = self._instantiate_resolved(TableStructureActor, **table_kwargs).run(batch_df)
 
         ocr_kwargs: dict[str, Any] = {
             "use_table_structure": extract_params.use_table_structure,
             "ocr_version": ocr_version,
+            "ocr_pipeline": getattr(extract_params, "ocr_pipeline", None),
+            "ocr_invoke_url": extract_params.ocr_invoke_url,
+            "line_detector_invoke_url": extract_params.line_detector_invoke_url,
+            "ocr_recognizer_invoke_url": extract_params.ocr_recognizer_invoke_url,
+            "tesseract_ocr_invoke_url": extract_params.tesseract_ocr_invoke_url,
+            "vietnamese_ocr_invoke_url": getattr(
+                extract_params, "vietnamese_ocr_invoke_url", None
+            ),
+            "vintern_ocr_invoke_url": getattr(
+                extract_params, "vintern_ocr_invoke_url", None
+            ),
+            "ministral_vlm_invoke_url": getattr(
+                extract_params, "ministral_vlm_invoke_url", None
+            ),
         }
         if ocr_lang is not None:
             ocr_kwargs["ocr_lang"] = ocr_lang
+        for scan_ocr_option in (
+            "scan_ocr_fallback",
+            "scan_ocr_preprocess",
+            "scan_ocr_tile_size",
+            "scan_ocr_tile_overlap",
+            "scan_ocr_min_quality",
+            "scan_ocr_max_retries",
+        ):
+            if hasattr(extract_params, scan_ocr_option):
+                ocr_kwargs[scan_ocr_option] = getattr(extract_params, scan_ocr_option)
         if extract_params.method in ("pdfium_hybrid", "ocr") and extract_params.extract_text:
             ocr_kwargs["extract_text"] = True
         if extract_params.extract_tables:
@@ -499,15 +649,112 @@ class _MultiTypeExtractBase(AbstractOperator):
             ocr_kwargs["extract_charts"] = True
         if extract_params.extract_infographics:
             ocr_kwargs["extract_infographics"] = True
-        if extract_params.ocr_invoke_url:
-            ocr_kwargs["ocr_invoke_url"] = extract_params.ocr_invoke_url
+        if extract_params.extract_images:
+            ocr_kwargs["extract_images"] = True
+            # Page Elements v3 calls image-like visual regions
+            # "infographic". Keep this enabled for scan documents even when
+            # the legacy infographic flag was not explicitly set.
+            ocr_kwargs["extract_infographics"] = True
+        ocr_kwargs["extract_stamps"] = False
         if extract_params.api_key:
             ocr_kwargs["api_key"] = extract_params.api_key
         if inference_batch_size:
             ocr_kwargs["inference_batch_size"] = int(inference_batch_size)
+        if document_batch_selected:
+            ocr_kwargs["inference_batch_size"] = (
+                OPTION6_VLM_BATCH_SIZE
+                if getattr(extract_params, "ocr_pipeline", None) == "pipeline-option6"
+                else (
+                    OPTION7_OCR_BATCH_SIZE
+                    if getattr(extract_params, "ocr_pipeline", None) == "pipeline-option7"
+                    else OPTION5_OCR_BATCH_SIZE
+                )
+            )
 
-        if any(
-            ocr_kwargs.get(key) for key in ("extract_text", "extract_tables", "extract_charts", "extract_infographics")
+        isolated_selector = getattr(extract_params, "ocr_pipeline", None)
+        if isolated_selector in {"pipeline-ppocrv6", "pipeline-tesseract"}:
+            from nemo_retriever.common.modality.ocr.isolated.option2 import run_option2_batch
+
+            batch_df = run_option2_batch(
+                batch_df,
+                ocr_invoke_url=extract_params.ocr_invoke_url,
+                vietnamese_ocr_invoke_url=getattr(
+                    extract_params, "vietnamese_ocr_invoke_url", None
+                ),
+                api_key=extract_params.api_key,
+                ocr_api_key=getattr(extract_params, "ocr_api_key", None),
+                ocr_lang=ocr_lang,
+                # Keep the exact Option 3 baseline in the separately-tunable
+                # Option 2 branch.
+                inference_batch_size=max(1, int(inference_batch_size or 1)),
+                request_timeout_s=float(
+                    getattr(extract_params, "ocr_request_timeout_s", None)
+                    or getattr(extract_params, "request_timeout_s", None)
+                    or 120.0
+                ),
+                scan_ocr_fallback=bool(getattr(extract_params, "scan_ocr_fallback", True)),
+                extract_text=bool(extract_params.extract_text),
+                extract_tables=bool(extract_params.extract_tables),
+                line_detector_invoke_url=extract_params.line_detector_invoke_url,
+            )
+        elif isolated_selector in {
+            "pipeline-option3",
+            "pipeline-option4",
+            "pipeline-option5",
+            "pipeline-option6",
+            "pipeline-option7",
+        }:
+            # The dedicated PDF graph has the same opt-in branch.  Keep mixed
+            # PDF/image extraction consistent without changing the default
+            # OCR archetype used when no selector is present.
+            from nemo_retriever.common.modality.ocr.isolated.runtime import run_isolated_ocr_batch
+
+            batch_df = run_isolated_ocr_batch(
+                batch_df,
+                ocr_pipeline=isolated_selector,
+                line_detector_invoke_url=extract_params.line_detector_invoke_url,
+                ocr_recognizer_invoke_url=extract_params.ocr_recognizer_invoke_url,
+                ocr_invoke_url=extract_params.ocr_invoke_url,
+                vietnamese_ocr_invoke_url=getattr(
+                    extract_params, "vietnamese_ocr_invoke_url", None
+                ),
+                vintern_ocr_invoke_url=getattr(
+                    extract_params, "vintern_ocr_invoke_url", None
+                ),
+                ministral_vlm_invoke_url=getattr(
+                    extract_params, "ministral_vlm_invoke_url", None
+                ),
+                tesseract_ocr_invoke_url=extract_params.tesseract_ocr_invoke_url,
+                api_key=extract_params.api_key,
+                ocr_api_key=getattr(extract_params, "ocr_api_key", None),
+                ocr_lang=ocr_lang,
+                inference_batch_size=(
+                    (
+                        OPTION6_VLM_BATCH_SIZE
+                        if isolated_selector == "pipeline-option6"
+                        else (
+                            OPTION7_OCR_BATCH_SIZE
+                            if isolated_selector == "pipeline-option7"
+                            else OPTION5_OCR_BATCH_SIZE
+                        )
+                    )
+                    if isolated_selector in {"pipeline-option5", "pipeline-option6", "pipeline-option7"}
+                    else int(inference_batch_size or 1)
+                ),
+                request_timeout_s=float(
+                    getattr(extract_params, "ocr_request_timeout_s", None)
+                    or getattr(extract_params, "request_timeout_s", None)
+                    or 120.0
+                ),
+                scan_ocr_fallback=bool(getattr(extract_params, "scan_ocr_fallback", True)),
+                scan_ocr_tile_size=int(getattr(extract_params, "scan_ocr_tile_size", 1024)),
+                scan_ocr_tile_overlap=float(getattr(extract_params, "scan_ocr_tile_overlap", 0.15)),
+                extract_text=bool(extract_params.extract_text),
+                extract_tables=bool(extract_params.extract_tables),
+            )
+        elif any(
+            ocr_kwargs.get(key)
+            for key in ("extract_text", "extract_tables", "extract_charts", "extract_infographics", "extract_images", "extract_stamps")
         ):
             ocr_archetype = resolve_ocr_archetype(extract_params)
             batch_df = self._instantiate_resolved(ocr_archetype, **ocr_kwargs).run(batch_df)
@@ -528,19 +775,27 @@ class _MultiTypeExtractBase(AbstractOperator):
         cfg = self._split_config.get(key)
         if isinstance(cfg, TextChunkParams):
             return cfg
+        if isinstance(cfg, dict):
+            return TextChunkParams(**cfg)
         if key == "text":
             return self.text_params
         if key == "html":
             return self.html_params
+        if key == "spreadsheet":
+            return self.text_params
         return None
 
     def _maybe_chunk(self, df: Any, key: str) -> Any:
         """Append a TextChunkActor pass when chunking is on for *key*."""
         params = self._split_config.get(key)
+        if isinstance(params, dict):
+            params = TextChunkParams(**params)
         if not isinstance(params, TextChunkParams):
             return df
         if not isinstance(df, pd.DataFrame) or df.empty:
             return df
+        if key == "pdf":
+            return chunk_pdf_content_rows(df, params=params)
         return TextChunkCPUActor(params=params).run(df)
 
     def _local_resources(self):
@@ -570,6 +825,48 @@ class MultiTypeExtractCPUActor(_MultiTypeExtractBase, CPUOperator):
     """CPU variant – used when all inference is remote."""
 
     pass
+
+
+class Option5MultiTypeExtractGPUActor(_MultiTypeExtractBase, GPUOperator):
+    """Global-batch GPU variant for the Option 5 mixed-file path."""
+
+    REQUIRES_GLOBAL_BATCH = True
+    GLOBAL_BATCH_GROUP_KEYS: tuple[str, ...] = ()
+
+
+class Option5MultiTypeExtractCPUActor(_MultiTypeExtractBase, CPUOperator):
+    """Global-batch CPU/remote variant for the Option 5 mixed-file path."""
+
+    REQUIRES_GLOBAL_BATCH = True
+    GLOBAL_BATCH_GROUP_KEYS: tuple[str, ...] = ()
+
+
+class Option7MultiTypeExtractGPUActor(_MultiTypeExtractBase, GPUOperator):
+    """Global-batch GPU variant for the Pipeline 7 mixed-file path."""
+
+    REQUIRES_GLOBAL_BATCH = True
+    GLOBAL_BATCH_GROUP_KEYS: tuple[str, ...] = ()
+
+
+class Option7MultiTypeExtractCPUActor(_MultiTypeExtractBase, CPUOperator):
+    """Global-batch CPU/remote variant for the Pipeline 7 mixed-file path."""
+
+    REQUIRES_GLOBAL_BATCH = True
+    GLOBAL_BATCH_GROUP_KEYS: tuple[str, ...] = ()
+
+
+class Option6MultiTypeExtractGPUActor(_MultiTypeExtractBase, GPUOperator):
+    """Global-batch GPU variant for the Pipeline 6 mixed-file path."""
+
+    REQUIRES_GLOBAL_BATCH = True
+    GLOBAL_BATCH_GROUP_KEYS: tuple[str, ...] = ()
+
+
+class Option6MultiTypeExtractCPUActor(_MultiTypeExtractBase, CPUOperator):
+    """Global-batch CPU/remote variant for the Pipeline 6 mixed-file path."""
+
+    REQUIRES_GLOBAL_BATCH = True
+    GLOBAL_BATCH_GROUP_KEYS: tuple[str, ...] = ()
 
 
 @designer_component(
@@ -633,3 +930,24 @@ class MultiTypeExtractOperator(ArchetypeOperator):
         self.video_text_dedup_params = video_text_dedup_params
         self.av_fuse_params = av_fuse_params
         self.split_config = split_config
+
+
+class Option5MultiTypeExtractOperator(MultiTypeExtractOperator):
+    """Option 5 archetype with document-global Ray batch semantics."""
+
+    _cpu_variant_class = Option5MultiTypeExtractCPUActor
+    _gpu_variant_class = Option5MultiTypeExtractGPUActor
+
+
+class Option7MultiTypeExtractOperator(MultiTypeExtractOperator):
+    """Pipeline 7 archetype with document-global Ray batch semantics."""
+
+    _cpu_variant_class = Option7MultiTypeExtractCPUActor
+    _gpu_variant_class = Option7MultiTypeExtractGPUActor
+
+
+class Option6MultiTypeExtractOperator(MultiTypeExtractOperator):
+    """Pipeline 6 archetype with document-global Ray batch semantics."""
+
+    _cpu_variant_class = Option6MultiTypeExtractCPUActor
+    _gpu_variant_class = Option6MultiTypeExtractGPUActor

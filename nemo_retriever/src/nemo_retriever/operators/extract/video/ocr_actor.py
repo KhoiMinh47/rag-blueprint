@@ -5,15 +5,15 @@
 """
 VideoFrameOCRActor: full-frame OCR for video frames.
 
-Thin wrapper around the shared :func:`ocr_b64_to_text` helper in
+Thin wrapper around the shared full-frame helper in
 :mod:`nemo_retriever.ocr.shared`. The CPU/GPU variants only own the
-model lifecycle (NIM client init, lazy ``NemotronOCRV2`` load); the
+model lifecycle (remote recognizer client init); the
 batch-shape handling and OCR call are reused from the page-elements
 OCR pipeline so response parsing, the empty-text fallback fix, and
 selective passthrough live in exactly one place.
 
 Configuration is read from loose kwargs (mirroring :class:`OCRActor`):
-``ocr_invoke_url`` / ``invoke_url``, ``api_key``, ``inference_batch_size``,
+``ocr_recognizer_invoke_url``, ``api_key``, ``inference_batch_size``,
 ``merge_level``, ``request_timeout_s``, plus the standard remote-retry
 knobs. Callers typically pass these straight from :class:`ExtractParams`
 so the user only configures OCR once.
@@ -32,7 +32,6 @@ from nemo_retriever.graph.designer import designer_component
 from nemo_retriever.operators.gpu_operator import GPUOperator
 from nemo_retriever.operators.operator_archetype import ArchetypeOperator
 from nemo_retriever.models.nim.nim import NIMClient
-from nemo_retriever.common.modality.ocr.config import resolve_ocr_v2_lang
 from nemo_retriever.common.modality.ocr.shared import (
     concat_with_passthrough,
     full_image_ocr_df,
@@ -46,26 +45,18 @@ _OCRABLE_CONTENT_TYPES = ("", _CT.VIDEO_FRAME)
 logger = logging.getLogger(__name__)
 
 
-def _ocr_invoke_url(ocr_kwargs: dict[str, Any]) -> str | None:
-    raw = ocr_kwargs.get("ocr_invoke_url") or ocr_kwargs.get("invoke_url")
+def _recognizer_url(ocr_kwargs: dict[str, Any]) -> str | None:
+    raw = ocr_kwargs.get("ocr_recognizer_invoke_url")
     return str(raw).strip() if raw else None
 
 
 class VideoFrameOCRGPUActor(AbstractOperator, GPUOperator):
-    """Local Nemotron OCR v2 on full video frames (one frame per ``invoke()`` call)."""
+    """GPU variant reserved for a configured remote PP-OCRv6 recognizer."""
 
     def __init__(self, **ocr_kwargs: Any) -> None:
         super().__init__(**ocr_kwargs)
         self._merge_level = str(ocr_kwargs.get("merge_level", "paragraph"))
-        self._ocr_version = str(ocr_kwargs.get("ocr_version", "v2"))
-        self._ocr_lang = ocr_kwargs.get("ocr_lang")
-        self._model = None  # lazily loaded on first call
-
-    def _ensure_model(self) -> None:
-        if self._model is None:
-            from nemo_retriever.models.local import NemotronOCRV2
-
-            self._model = NemotronOCRV2(lang=resolve_ocr_v2_lang(self._ocr_version, self._ocr_lang))
+        self._model = None
 
     def preprocess(self, data: Any, **kwargs: Any) -> Any:
         return data
@@ -76,8 +67,7 @@ class VideoFrameOCRGPUActor(AbstractOperator, GPUOperator):
         ocr_df, passthrough = split_ocrable_rows(batch_df, _OCRABLE_CONTENT_TYPES)
         if ocr_df.empty:
             return passthrough
-        self._ensure_model()
-        out = full_image_ocr_df(ocr_df, model=self._model, merge_level=self._merge_level)
+        raise RuntimeError("Video frame OCR is disabled; document ingest uses PP-OCRv6 line detection + recognition.")
         return concat_with_passthrough(out, passthrough)
 
     def postprocess(self, data: Any, **kwargs: Any) -> Any:
@@ -85,17 +75,13 @@ class VideoFrameOCRGPUActor(AbstractOperator, GPUOperator):
 
 
 class VideoFrameOCRCPUActor(AbstractOperator, CPUOperator):
-    """Remote Nemotron OCR on full video frames, batched per call.
-
-    Hosted OCR NIM defaults to Nemotron OCR v2; the local GPU variant uses
-    ``NemotronOCRV2`` with the selected OCR mode.
-    """
-
-    DEFAULT_INVOKE_URL = "https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-ocr-v2"
+    """Compatibility variant using the configured PP-OCRv6 recognizer."""
 
     def __init__(self, **ocr_kwargs: Any) -> None:
         super().__init__(**ocr_kwargs)
-        self._invoke_url = (_ocr_invoke_url(ocr_kwargs) or self.DEFAULT_INVOKE_URL).strip()
+        self._invoke_url = (_recognizer_url(ocr_kwargs) or "").strip()
+        if not self._invoke_url:
+            raise ValueError("ocr_recognizer_invoke_url is required for video frame OCR")
         self._api_key = ocr_kwargs.get("api_key")
         self._batch_size = int(ocr_kwargs.get("inference_batch_size") or ocr_kwargs.get("batch_size") or 8)
         self._merge_level = str(ocr_kwargs.get("merge_level", "paragraph"))
@@ -116,17 +102,10 @@ class VideoFrameOCRCPUActor(AbstractOperator, CPUOperator):
         ocr_df, passthrough = split_ocrable_rows(batch_df, _OCRABLE_CONTENT_TYPES)
         if ocr_df.empty:
             return passthrough
-        out = full_image_ocr_df(
-            ocr_df,
-            invoke_url=self._invoke_url,
-            api_key=self._api_key,
-            nim_client=self._nim_client,
-            merge_level=self._merge_level,
-            batch_size=self._batch_size,
-            timeout_s=self._timeout_s,
-            retry=self._remote_retry,
+        raise RuntimeError(
+            "Video frame OCR is disabled; the document pipeline uses only "
+            "PP-OCRv6 line detection and recognition on Page Elements crops."
         )
-        return concat_with_passthrough(out, passthrough)
 
     def postprocess(self, data: Any, **kwargs: Any) -> Any:
         return data
@@ -136,19 +115,17 @@ class VideoFrameOCRCPUActor(AbstractOperator, CPUOperator):
     name="Video Frame OCR",
     category="Video",
     compute="gpu",
-    description="Runs Nemotron OCR directly on full video frames",
+    description="Disabled legacy full-frame OCR branch; document OCR uses PP-OCRv6 crops",
 )
 class VideoFrameOCRActor(ArchetypeOperator):
     """Graph-facing archetype that resolves to GPU or CPU variant.
 
-    Routes to the CPU (NIM) variant when ``ocr_invoke_url`` (or
-    ``invoke_url``) is provided; otherwise loads the local Nemotron OCR
-    model on GPU.
+    Routes to the remote PP-OCRv6 recognizer when configured.
     """
 
     @classmethod
     def prefers_cpu_variant(cls, operator_kwargs: dict[str, Any] | None = None) -> bool:
-        return bool(_ocr_invoke_url(operator_kwargs or {}))
+        return bool(_recognizer_url(operator_kwargs or {}))
 
     @classmethod
     def cpu_variant_class(cls):

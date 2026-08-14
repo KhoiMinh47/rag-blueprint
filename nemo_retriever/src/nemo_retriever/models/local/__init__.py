@@ -13,8 +13,6 @@ modules, allowing unit tests with minimal deps to run.
 
 __all__ = [
     "NemotronPageElementsV3",
-    "NemotronOCRV1",
-    "NemotronOCRV2",
     "NemotronTableStructureV1",
     "NemotronParseV12",
     "NemotronRerankV2",
@@ -29,14 +27,6 @@ def __getattr__(name: str):
         from nemo_retriever.models.local.nemotron_page_elements_v3 import NemotronPageElementsV3
 
         return NemotronPageElementsV3
-    if name == "NemotronOCRV1":
-        from nemo_retriever.models.local.nemotron_ocr_v1 import NemotronOCRV1
-
-        return NemotronOCRV1
-    if name == "NemotronOCRV2":
-        from nemo_retriever.models.local.nemotron_ocr_v2 import NemotronOCRV2
-
-        return NemotronOCRV2
     if name == "NemotronTableStructureV1":
         from nemo_retriever.models.local.nemotron_table_structure_v1 import NemotronTableStructureV1
 

@@ -21,6 +21,7 @@ function JobsView({ onOpenJob }) {
   const [sseStatus, setSseStatus] = React.useState('connecting');
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState(null);
+  const [deletingJobId, setDeletingJobId] = React.useState(null);
   const evtRef = React.useRef(null);
 
   // ------------------------------------------------------------------
@@ -98,6 +99,12 @@ function JobsView({ onOpenJob }) {
         try {
           const ev = JSON.parse(e.data);
           if (!ev.job_id) return;
+          if (ev.type === 'job_deleted') {
+            setJobs(prev => prev.filter(j => j.job_id !== ev.job_id));
+            setTotal(prev => Math.max(0, prev - 1));
+            setTotalFiltered(prev => Math.max(0, prev - 1));
+            return;
+          }
           setJobs(prev => {
             const idx = prev.findIndex(j => j.job_id === ev.job_id);
             const patched = {
@@ -155,10 +162,10 @@ function JobsView({ onOpenJob }) {
   function relativeTime(iso) {
     if (!iso) return '—';
     const diff = (Date.now() - new Date(iso).getTime()) / 1000;
-    if (diff < 60) return Math.round(diff) + 's ago';
-    if (diff < 3600) return Math.round(diff / 60) + 'm ago';
-    if (diff < 86400) return Math.round(diff / 3600) + 'h ago';
-    return Math.round(diff / 86400) + 'd ago';
+    if (diff < 60) return Math.round(diff) + ' giây trước';
+    if (diff < 3600) return Math.round(diff / 60) + ' phút trước';
+    if (diff < 86400) return Math.round(diff / 3600) + ' giờ trước';
+    return Math.round(diff / 86400) + ' ngày trước';
   }
 
   function statusBadge(status) {
@@ -170,7 +177,11 @@ function JobsView({ onOpenJob }) {
       running: 'badge-yellow',
       pending: 'badge-blue',
     }[status] || 'badge-dim';
-    return React.createElement('span', { className: `badge ${cls}` }, status);
+    const labels = {
+      completed: 'hoàn tất', failed: 'lỗi', partial_success: 'thành công một phần',
+      processing: 'đang xử lý', running: 'đang chạy', pending: 'đang chờ',
+    };
+    return React.createElement('span', { className: `badge ${cls}` }, labels[status] || status || '—');
   }
 
   function progressFor(j) {
@@ -179,6 +190,32 @@ function JobsView({ onOpenJob }) {
     const c = (j.counts && j.counts.completed) || 0;
     const f = (j.counts && j.counts.failed) || 0;
     return Math.min(100, Math.round(((c + f) / exp) * 100));
+  }
+
+  async function deleteJob(job) {
+    const confirmed = window.confirm(
+      `Xóa job ${job.job_id}?\n\nThao tác này xóa lịch sử job, bản ghi tài liệu, result_data đã giữ lại và bản PDF trong trình duyệt. Các row trong VectorDB vẫn giữ nguyên vì backend hiện chưa có khóa an toàn để map chúng về job.`
+    );
+    if (!confirmed) return;
+    setDeletingJobId(job.job_id);
+    setError(null);
+    try {
+      const response = await fetch(`/v1/dashboard/api/jobs/${job.job_id}`, { method: 'DELETE' });
+      if (!response.ok) {
+        let detail = `HTTP ${response.status}`;
+        try { detail = (await response.json()).detail || detail; } catch {}
+        throw new Error(detail);
+      }
+      if (window.NemoDebugStore) await window.NemoDebugStore.remove(job.job_id).catch(() => {});
+      setJobs(prev => prev.filter(item => item.job_id !== job.job_id));
+      setTotal(prev => Math.max(0, prev - 1));
+      setTotalFiltered(prev => Math.max(0, prev - 1));
+      setSummary(prev => ({ ...prev, total_jobs: Math.max(0, (prev.total_jobs || 0) - 1) }));
+    } catch (e) {
+      setError(`Xóa thất bại: ${e.message || e}`);
+    } finally {
+      setDeletingJobId(null);
+    }
   }
 
   const totalJobs = summary.total_jobs || 0;
@@ -201,9 +238,9 @@ function JobsView({ onOpenJob }) {
       React.createElement('span', {
         className: `status-dot ${sseStatus === 'connected' ? 'ok' : sseStatus === 'connecting' ? 'unknown' : 'error'}`,
       }),
-      `SSE: ${sseStatus}`,
+      `Luồng SSE: ${sseStatus}`,
       React.createElement('span', { style: { marginLeft: 16 } },
-        `Showing ${jobs.length} of ${totalFiltered} jobs (${total} total)`
+        `Hiển thị ${jobs.length} / ${totalFiltered} job (${total} tổng số)`
       ),
       React.createElement('div', { style: { marginLeft: 'auto', display: 'flex', gap: 8 } },
         React.createElement('select', {
@@ -212,9 +249,12 @@ function JobsView({ onOpenJob }) {
           value: statusFilter,
           onChange: (e) => { setOffset(0); setStatusFilter(e.target.value); },
         },
-          React.createElement('option', { value: '' }, 'All statuses'),
+          React.createElement('option', { value: '' }, 'Tất cả trạng thái'),
           ['pending', 'running', 'completed', 'failed', 'partial_success'].map(s =>
-            React.createElement('option', { key: s, value: s }, s)
+            React.createElement('option', { key: s, value: s }, ({
+              pending: 'đang chờ', running: 'đang chạy', completed: 'hoàn tất',
+              failed: 'lỗi', partial_success: 'thành công một phần',
+            })[s])
           ),
         ),
         React.createElement('select', {
@@ -223,28 +263,28 @@ function JobsView({ onOpenJob }) {
           value: sort,
           onChange: (e) => { setOffset(0); setSort(e.target.value); },
         },
-          React.createElement('option', { value: 'created_desc' }, 'Newest first'),
-          React.createElement('option', { value: 'created_asc' }, 'Oldest first'),
-          React.createElement('option', { value: 'finalized_desc' }, 'Recently finished'),
-          React.createElement('option', { value: 'finalized_asc' }, 'Earliest finished'),
+          React.createElement('option', { value: 'created_desc' }, 'Mới nhất trước'),
+          React.createElement('option', { value: 'created_asc' }, 'Cũ nhất trước'),
+          React.createElement('option', { value: 'finalized_desc' }, 'Mới hoàn tất trước'),
+          React.createElement('option', { value: 'finalized_asc' }, 'Hoàn tất sớm nhất'),
         ),
         React.createElement('button', {
           className: 'btn btn-primary',
           style: { padding: '6px 12px', fontSize: 12 },
           onClick: fetchPage,
-        }, loading ? 'Loading…' : 'Refresh'),
+        }, loading ? 'Đang tải…' : 'Làm mới'),
       ),
     ),
 
     /* Stats row */
     React.createElement('div', { className: 'card-grid', style: { marginBottom: 24 } },
       [
-        { label: 'Jobs',     value: totalJobs },
-        { label: 'Documents', value: totalDocs },
-        { label: 'Running',  value: jobsRunning },
-        { label: 'Completed', value: jobsCompleted },
-        { label: 'Failed',   value: jobsFailed },
-        { label: 'Partial',  value: jobsPartial },
+        { label: 'Job',     value: totalJobs },
+        { label: 'Tài liệu', value: totalDocs },
+        { label: 'Đang chạy',  value: jobsRunning },
+        { label: 'Hoàn tất', value: jobsCompleted },
+        { label: 'Lỗi',   value: jobsFailed },
+        { label: 'Một phần',  value: jobsPartial },
       ].map(s =>
         React.createElement('div', { key: s.label, className: 'card' },
           React.createElement('div', { className: 'card-title' }, s.label),
@@ -256,18 +296,18 @@ function JobsView({ onOpenJob }) {
     error && React.createElement('div', {
       className: 'card',
       style: { marginBottom: 16, color: 'var(--nv-red)' }
-    }, `Failed to load jobs: ${error}`),
+    }, `Tải danh sách job thất bại: ${error}`),
 
     /* Job table */
     React.createElement('div', { className: 'section' },
-      React.createElement('div', { className: 'section-title' }, 'Jobs'),
+      React.createElement('div', { className: 'section-title' }, 'Danh sách job'),
       jobs.length === 0 && !loading
-        ? React.createElement('div', { className: 'empty-state' }, 'No jobs match the current filters')
+        ? React.createElement('div', { className: 'empty-state' }, 'Không có job phù hợp với bộ lọc hiện tại')
         : React.createElement('div', { className: 'table-wrap' },
             React.createElement('table', null,
               React.createElement('thead', null,
                 React.createElement('tr', null,
-                  ['Job ID', 'Trace ID', 'Status', 'Label', 'Progress', 'Docs', 'Created', 'Elapsed'].map(h =>
+                  ['ID job', 'Trace ID', 'Trạng thái', 'Nhãn', 'Tiến độ', 'Tài liệu', 'Tạo lúc', 'Thời gian', ''].map(h =>
                     React.createElement('th', { key: h }, h)
                   )
                 )
@@ -326,6 +366,14 @@ function JobsView({ onOpenJob }) {
                     React.createElement('td', { className: 'mono' },
                       j.elapsed_s != null ? j.elapsed_s.toFixed(1) + 's' : '—'
                     ),
+                    React.createElement('td', null,
+                      React.createElement('button', {
+                        className: 'btn',
+                        style: { padding: '2px 8px', fontSize: 11, background: 'rgba(255,80,80,0.12)', color: 'var(--nv-red)' },
+                        disabled: deletingJobId === j.job_id,
+                        onClick: (e) => { e.preventDefault(); e.stopPropagation(); deleteJob(j); },
+                      }, deletingJobId === j.job_id ? 'Đang xóa…' : 'Xóa')
+                    ),
                   );
                 })
               )
@@ -342,16 +390,16 @@ function JobsView({ onOpenJob }) {
         style: { padding: '6px 12px', fontSize: 12, opacity: offset === 0 ? 0.5 : 1 },
         disabled: offset === 0,
         onClick: () => setOffset(Math.max(0, offset - limit)),
-      }, '← Prev'),
+      }, '← Trước'),
       React.createElement('span', { style: { padding: '6px 12px', fontSize: 12, color: 'var(--nv-text-muted)' } },
-        `Page ${Math.floor(offset / limit) + 1} of ${Math.max(1, Math.ceil(totalFiltered / limit))}`
+        `Trang ${Math.floor(offset / limit) + 1} / ${Math.max(1, Math.ceil(totalFiltered / limit))}`
       ),
       React.createElement('button', {
         className: 'btn',
         style: { padding: '6px 12px', fontSize: 12, opacity: offset + limit >= totalFiltered ? 0.5 : 1 },
         disabled: offset + limit >= totalFiltered,
         onClick: () => setOffset(offset + limit),
-      }, 'Next →'),
+      }, 'Tiếp →'),
     ),
   );
 }

@@ -189,6 +189,54 @@ ENTRYPOINT ["/usr/local/bin/retriever-service-entrypoint"]
 CMD ["retriever", "service", "start", "--config", "/etc/nemo-retriever/retriever-service.yaml"]
 
 # ---------------------------------------------------------------------------
+# PP-OCRv6 sidecar image.  Detector and recognizer are intentionally started
+# as separate Compose containers from this same image so each model has its
+# own HTTP endpoint and GPU allocation.
+# ---------------------------------------------------------------------------
+FROM service AS ppocrv6
+
+USER root
+ARG PADDLEOCR_VERSION="3.7.0"
+ARG PADDLEPADDLE_VERSION="3.3.0"
+ARG PADDLEPADDLE_INDEX_URL="https://www.paddlepaddle.org.cn/packages/stable/cu130/"
+RUN pip install --no-cache-dir \
+      "paddleocr==${PADDLEOCR_VERSION}" \
+      "paddlepaddle-gpu==${PADDLEPADDLE_VERSION}" \
+      --extra-index-url "${PADDLEPADDLE_INDEX_URL}"
+COPY tools/ppocrv6_service /opt/ppocrv6_service
+RUN chmod -R a+rX /opt/ppocrv6_service
+USER nemo
+WORKDIR /opt/ppocrv6_service
+ENTRYPOINT []
+CMD ["uvicorn", "ppocrv6_service:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# ---------------------------------------------------------------------------
+# CPU Tesseract 5 recognizer sidecar.  Page Elements and the line detector
+# remain separate services; this image only provides the recognizer endpoint.
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim-bookworm AS tesseract
+
+ENV PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl \
+      tesseract-ocr \
+      tesseract-ocr-eng \
+      tesseract-ocr-vie \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir fastapi uvicorn pillow pytesseract
+RUN groupadd --gid 1000 nemo \
+    && useradd --uid 1000 --gid 1000 --create-home --home-dir /opt/tesseract_service --shell /usr/sbin/nologin nemo
+COPY tools/tesseract_service /opt/tesseract_service
+RUN chmod -R a+rX /opt/tesseract_service \
+    && mkdir -p /var/cache/tesseract \
+    && chown -R nemo:nemo /opt/tesseract_service /var/cache/tesseract
+USER nemo
+WORKDIR /opt/tesseract_service
+ENTRYPOINT []
+CMD ["uvicorn", "tesseract_service:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# ---------------------------------------------------------------------------
 # GPU service profile: FastAPI ingest service with in-pod Hugging Face models.
 #
 # Build:  docker build -f Dockerfile --target service-gpu \
@@ -229,3 +277,28 @@ USER nemo
 ENTRYPOINT ["/usr/local/bin/retriever-service-entrypoint"]
 
 CMD ["retriever", "service", "start", "--config", "/etc/nemo-retriever/retriever-service.yaml"]
+
+# ---------------------------------------------------------------------------
+# GPU VietOCR sidecar for Option 3. It is separate from the Retriever API
+# and from all PP-OCRv6/Tesseract/Vintern services. The predictor is loaded
+# once at startup and the HTTP endpoint never downloads a model per request.
+# ---------------------------------------------------------------------------
+# VietOCR is an isolated recognizer sidecar.  It only needs the base service
+# runtime plus its own torch/vietocr dependencies; inheriting service-gpu here
+# also installs vLLM/flashinfer and the full local-model stack unnecessarily.
+FROM service AS vietocr
+
+USER root
+# VietOCR does not declare torch as an install requirement, but its predictor
+# imports it at runtime.  Install only the OCR GPU runtime here; keep the
+# retriever's vLLM/flashinfer local-model stack out of this sidecar image.
+RUN pip install --no-cache-dir \
+      "torch==2.11.0" \
+      "torchvision==0.26.0" \
+      vietocr
+COPY tools/vietocr_service /opt/vietocr_service
+RUN chmod -R a+rX /opt/vietocr_service
+USER nemo
+WORKDIR /opt/vietocr_service
+ENTRYPOINT []
+CMD ["uvicorn", "vietocr_service:app", "--host", "0.0.0.0", "--port", "8000"]

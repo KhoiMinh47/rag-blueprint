@@ -86,6 +86,7 @@ _EXPLICIT_MODE_INPUT_TYPES: dict[str, frozenset[str]] = {
     "image": frozenset({"image"}),
     "text": frozenset({"txt"}),
     "html": frozenset({"html"}),
+    "spreadsheet": frozenset({"spreadsheet"}),
     "audio": frozenset({"audio"}),
     "video": frozenset({"video"}),
 }
@@ -134,6 +135,17 @@ class GraphIngestionError(RuntimeError):
         self.records = records
         self.stage_diagnostics = dict(stage_diagnostics) if stage_diagnostics else {}
         super().__init__(_format_stage_error_message(records, self.stage_diagnostics))
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        """Preserve structured records when the error crosses a process pool.
+
+        ``RuntimeError`` normally pickles only ``self.args``.  Here ``args``
+        contains the already-rendered message, so unpickling in the service
+        process used to call ``GraphIngestionError(message)`` and the message
+        formatter iterated over it character by character (``G; r; a; ...``).
+        Reconstruct with the original records and stage diagnostics instead.
+        """
+        return type(self), (self.records, self.stage_diagnostics)
 
 
 def _normalize_stage_error_record(record: Any) -> dict[str, Any] | None:
@@ -602,6 +614,20 @@ class GraphIngestor(ingestor):
         self._record_stage("extract")
         return self
 
+    def extract_spreadsheet(
+        self,
+        params: Optional[TextChunkParams] = None,
+        *,
+        split_config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> "GraphIngestor":
+        """Configure native XLSX/XLS/CSV extraction."""
+        self._extraction_mode = "spreadsheet"
+        self._text_params = _coerce(params, kwargs, default_factory=TextChunkParams)
+        self._apply_split_config(split_config)
+        self._record_stage("extract")
+        return self
+
     def extract_audio(
         self,
         params: Optional[AudioChunkParams] = None,
@@ -637,7 +663,7 @@ class GraphIngestor(ingestor):
         files are routed to a combined audio-from-video ASR + frame OCR +
         scene fusion pipeline.
 
-        Frame OCR config (``ocr_invoke_url``, ``ocr_api_key``,
+        Frame OCR config (``ocr_recognizer_invoke_url``, ``ocr_api_key``,
         ``inference_batch_size``, ``ocr_request_timeout_s``) is read from
         :class:`ExtractParams` — the same object the PDF/image pipelines
         use — so the user only configures OCR once.
@@ -1213,8 +1239,22 @@ class GraphIngestor(ingestor):
         if self._params_has_configured_field(extract, ("ocr_invoke_url",)):
             diagnostics["ocr"] = _StageDiagnostic(
                 column="ocr",
-                display_name="OCR NIM",
+                display_name="Nemotron OCR v2 NIM",
                 invoke_url=self._param_value(extract, "ocr_invoke_url"),
+                role="ocr",
+            )
+        if self._params_has_configured_field(extract, ("line_detector_invoke_url",)):
+            diagnostics["ocr_line_detector"] = _StageDiagnostic(
+                column="ocr",
+                display_name="PP-OCRv6 line detector",
+                invoke_url=self._param_value(extract, "line_detector_invoke_url"),
+                role="ocr",
+            )
+        if self._params_has_configured_field(extract, ("ocr_recognizer_invoke_url",)):
+            diagnostics["ocr_recognizer"] = _StageDiagnostic(
+                column="ocr",
+                display_name="PP-OCRv6 recognizer",
+                invoke_url=self._param_value(extract, "ocr_recognizer_invoke_url"),
                 role="ocr",
             )
         if self._params_has_configured_field(extract, ("table_structure_invoke_url",)):

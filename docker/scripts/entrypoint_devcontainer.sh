@@ -15,7 +15,7 @@
 # limitations under the License.
 
 
-# Source "source" file if it exists
+# Source "source" file if it existss
 SRC_FILE="/opt/docker/bin/entrypoint_source"
 [ -f "${SRC_FILE}" ] && source "${SRC_FILE}"
 

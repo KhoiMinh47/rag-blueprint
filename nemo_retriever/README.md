@@ -183,11 +183,9 @@ retriever ingest /your-example-dir \
   --embed-model-name nvidia/llama-nemotron-embed-1b-v2
 ```
 
-> **OCR engine default:** The default OCR engine is **Nemotron OCR v2**. Use
-> `--ocr-version v1` to opt into the legacy OCR engine. Local OCR v2 defaults
-> to multilingual mode (`multi`); pass `--ocr-lang english` for the English-only
-> v2 selector. Remote OCR NIM endpoints decide their own model and language
-> behavior, and the local OCR selectors are not added to remote request payloads.
+> **OCR engine default:** Nemotron OCR v2 performs integrated detection and
+> recognition. The split PP-OCRv6 detector/recognizer endpoints remain an
+> explicit fallback only when `--ocr-invoke-url` is not configured.
 
 When you use a remote embedder, the endpoint and provider prefix remain runtime
 configuration. The query model is read from LanceDB metadata when available;

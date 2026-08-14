@@ -166,6 +166,7 @@ def _error_record(
         "page_number": int(page_number),
         "text": "",
         "page_image": None,
+        "page_elements_image": None,
         "images": [],
         "tables": [],
         "charts": [],
@@ -193,6 +194,41 @@ def _extract_page_text(page) -> str:
     """
     textpage = page.get_textpage()
     return textpage.get_text_bounded()
+
+
+def _extract_page_text_with_spans(page) -> Tuple[str, List[Dict[str, Any]]]:
+    """Extract PDFium text plus top-left normalized character boxes.
+
+    The old extractor returned only one full-page string.  Keeping character
+    geometry temporarily lets the post-extraction cleaner remove text that is
+    also represented by a table/chart OCR block and then rebuild ordered text
+    blocks.  The temporary spans are consumed before result rows are retained.
+    """
+    textpage = page.get_textpage()
+    page_width = max(float(page.get_width()), 1.0)
+    page_height = max(float(page.get_height()), 1.0)
+    spans: List[Dict[str, Any]] = []
+    chars: List[str] = []
+    for index in range(int(textpage.count_chars())):
+        char = textpage.get_text_range(index, 1) or ""
+        chars.append(char)
+        if char in {"\r", "\n"}:
+            spans.append({"char": char, "bbox_xyxy_norm": None, "index": index})
+            continue
+        try:
+            x0, y0, x1, y1 = [float(value) for value in textpage.get_charbox(index)]
+            # PDFium uses a bottom-left origin; page-element bboxes use a
+            # top-left origin, so invert the y coordinates here.
+            bbox = [
+                max(0.0, min(1.0, x0 / page_width)),
+                max(0.0, min(1.0, (page_height - y1) / page_height)),
+                max(0.0, min(1.0, x1 / page_width)),
+                max(0.0, min(1.0, (page_height - y0) / page_height)),
+            ]
+        except Exception:
+            bbox = None
+        spans.append({"char": char, "bbox_xyxy_norm": bbox, "index": index})
+    return "".join(chars), spans
 
 
 def pdf_extraction(
@@ -236,6 +272,7 @@ def pdf_extraction(
             "source_id",
             "text",
             "page_image",
+            "page_elements_image",
             "images",
             "tables",
             "charts",
@@ -310,8 +347,9 @@ def pdf_extraction(
                     text = ""
 
                     # Text extraction
+                    native_text_spans: List[Dict[str, Any]] = []
                     if extract_text and not ocr_extraction_needed_for_text:
-                        page_text = _extract_page_text(page)
+                        page_text, native_text_spans = _extract_page_text_with_spans(page)
                         # TODO: Tiddy up logic here for document depth option
                         if text_depth == "page":
                             text = page_text
@@ -329,14 +367,33 @@ def pdf_extraction(
                         or ocr_extraction_needed_for_text
                     )
                     render_info: Optional[Dict[str, Any]] = None
+                    page_elements_render_info: Optional[Dict[str, Any]] = None
+                    effective_render_mode = render_mode
                     if want_any_raster:
+                        # Keep native pages on the configured model-sized
+                        # raster, but preserve scan detail before Page
+                        # Elements tiling/cropping. The detector can then
+                        # inspect small seals and illustrations instead of
+                        # receiving a page already reduced to ~1024 px.
+                        effective_render_mode = "full_dpi" if is_scanned_page else render_mode
                         render_info = _render_page_to_base64(
                             page,
                             dpi=dpi,
                             image_format=image_format,
                             jpeg_quality=jpeg_quality,
-                            render_mode=render_mode,
+                            render_mode=effective_render_mode,
                         )
+                        if is_scanned_page and effective_render_mode == "full_dpi":
+                            # Page Elements keeps a model-sized baseline for
+                            # page-level geometry; the high-resolution page
+                            # raster remains available for tiling and OCR.
+                            page_elements_render_info = _render_page_to_base64(
+                                page,
+                                dpi=dpi,
+                                image_format=image_format,
+                                jpeg_quality=jpeg_quality,
+                                render_mode="fit_to_model",
+                            )
 
                     # Extract cropped images from pdfium page objects.
                     detected_images: List[Dict[str, Any]] = []
@@ -368,6 +425,7 @@ def pdf_extraction(
                         "source_id": source_id,
                         "text": text if extract_text else "",
                         "page_image": None,
+                        "page_elements_image": None,
                         "images": detected_images,
                         "tables": [],
                         "charts": [],
@@ -376,16 +434,23 @@ def pdf_extraction(
                             "has_text": has_text,
                             "needs_ocr_for_text": ocr_extraction_needed_for_text,
                             "dpi": dpi,
+                            "render_mode": effective_render_mode,
                             "source_path": pdf_path,
                             "error": None,
                         },
                     }
+
+                    if native_text_spans:
+                        # Consumed by clean_content_rows before embedding; do
+                        # not expose the per-character payload in final rows.
+                        page_record["_native_text_spans"] = native_text_spans
 
                     if want_any_raster and render_info is not None:
                         # Store the rendered page raster only here; leave the other
                         # fields empty so downstream stages have a single canonical
                         # place to find the page image.
                         page_record["page_image"] = render_info
+                        page_record["page_elements_image"] = page_elements_render_info
 
                     page_record.update(extra)
                     outputs.append(page_record)

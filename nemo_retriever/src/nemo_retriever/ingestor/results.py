@@ -21,6 +21,7 @@ import numpy as np
 ResultSchema = Literal["legacy", "compact"]
 
 _MAX_STR_LEN = 500
+_FULL_TEXT_FIELD_NAMES = frozenset({"text", "content", "markdown", "page_text"})
 _RAW_IMAGE_FIELD_NAMES = frozenset({"image_b64", "_image_b64"})
 _EMBEDDING_FIELD_NAMES = frozenset({"embedding", "embeddings"})
 _EMBEDDING_PAYLOAD_COLUMNS = frozenset({"text_embeddings_1b_v2"})
@@ -171,6 +172,10 @@ def _sanitize_result_value(
         if _contains_requested_payload(val, return_embeddings=return_embeddings, return_images=return_images):
             return sanitized
         return sanitize_cell_value(sanitized)
+    if isinstance(val, str) and key in _FULL_TEXT_FIELD_NAMES:
+        # Retained debug results must preserve the complete parsed text. Other
+        # diagnostic strings still use the 500-character safety limit below.
+        return val
     return sanitize_cell_value(val)
 
 

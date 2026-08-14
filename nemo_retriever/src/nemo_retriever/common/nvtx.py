@@ -7,7 +7,7 @@ Usage::
 
     from nemo_retriever.common.nvtx import gpu_inference_range
 
-    with gpu_inference_range("NemotronOCRv1", batch_size=8):
+    with gpu_inference_range("PP-OCRv6", batch_size=8):
         result = self._model(input_data)
 
 When ``nsys`` is launched with ``--capture-range=nvtx --nvtx-capture=gpu_inference``,
@@ -29,7 +29,7 @@ def gpu_inference_range(model_name: str, batch_size: int = -1, **extra):
     The outer range is always named ``gpu_inference`` so that
     ``nsys --nvtx-capture=gpu_inference`` can trigger on it.
     The inner range carries the human-readable label visible in
-    the Nsight Systems timeline (e.g. ``NemotronOCRv1 | bs=8``).
+    the Nsight Systems timeline (e.g. ``PP-OCRv6 | bs=8``).
     """
     parts = [model_name]
     if batch_size >= 0:

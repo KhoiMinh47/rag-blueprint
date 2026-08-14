@@ -108,7 +108,6 @@ class HarnessConfig:
     embed_model_name: str = "nvidia/llama-nemotron-embed-1b-v2"
     embed_modality: str = "text"
     embed_granularity: str = "element"
-    ocr_version: str | None = None
     ocr_lang: str | None = None
     extract_page_as_image: bool = True
     extract_infographics: bool = False
@@ -135,7 +134,8 @@ class HarnessConfig:
     kubectl_sudo: bool = False
 
     page_elements_invoke_url: str | None = None
-    ocr_invoke_url: str | None = None
+    line_detector_invoke_url: str | None = None
+    ocr_recognizer_invoke_url: str | None = None
     table_structure_invoke_url: str | None = None
     embed_invoke_url: str | None = None
     caption_invoke_url: str | None = None
@@ -244,12 +244,8 @@ class HarnessConfig:
         if self.embed_granularity not in VALID_EMBED_GRANULARITIES:
             errors.append(f"embed_granularity must be one of {sorted(VALID_EMBED_GRANULARITIES)}")
 
-        if self.ocr_version is not None and self.ocr_version not in {"v1", "v2"}:
-            errors.append("ocr_version must be one of ['v1', 'v2'] when provided")
         if self.ocr_lang is not None and self.ocr_lang not in VALID_OCR_LANGS:
             errors.append(f"ocr_lang must be one of {sorted(VALID_OCR_LANGS)} when provided")
-        if self.ocr_version == "v1" and self.ocr_lang is not None:
-            errors.append("ocr_lang is only supported when ocr_version='v2'")
 
         if not str(self.lancedb_table_name).strip():
             errors.append("lancedb_table_name must be a non-empty string")
@@ -426,7 +422,6 @@ def _apply_env_overrides(config_dict: dict[str, Any]) -> None:
         "HARNESS_EMBED_MODEL_NAME": ("embed_model_name", str),
         "HARNESS_EMBED_MODALITY": ("embed_modality", str),
         "HARNESS_EMBED_GRANULARITY": ("embed_granularity", str),
-        "HARNESS_OCR_VERSION": ("ocr_version", str),
         "HARNESS_OCR_LANG": ("ocr_lang", str),
         "HARNESS_EXTRACT_PAGE_AS_IMAGE": ("extract_page_as_image", _parse_bool),
         "HARNESS_EXTRACT_INFOGRAPHICS": ("extract_infographics", _parse_bool),
@@ -451,7 +446,8 @@ def _apply_env_overrides(config_dict: dict[str, Any]) -> None:
         "HARNESS_KUBECTL_SUDO": ("kubectl_sudo", _parse_bool),
         "HARNESS_API_KEY": ("api_key", str),
         "HARNESS_PAGE_ELEMENTS_INVOKE_URL": ("page_elements_invoke_url", str),
-        "HARNESS_OCR_INVOKE_URL": ("ocr_invoke_url", str),
+        "HARNESS_LINE_DETECTOR_INVOKE_URL": ("line_detector_invoke_url", str),
+        "HARNESS_OCR_RECOGNIZER_INVOKE_URL": ("ocr_recognizer_invoke_url", str),
         "HARNESS_TABLE_STRUCTURE_INVOKE_URL": ("table_structure_invoke_url", str),
         "HARNESS_EMBED_INVOKE_URL": ("embed_invoke_url", str),
         "HARNESS_CAPTION_INVOKE_URL": ("caption_invoke_url", str),

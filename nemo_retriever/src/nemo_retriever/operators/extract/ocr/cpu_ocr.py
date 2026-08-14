@@ -19,7 +19,9 @@ from nemo_retriever.common.modality.ocr.shared import ocr_page_elements
 class OCRCPUActor(AbstractOperator, CPUOperator):
     """Remote OCR variant of :class:`OCRActor`.
 
-    Defaults to the hosted Nemotron OCR v2 NIM endpoint.
+    Nemotron OCR v2 is preferred whenever ``ocr_invoke_url`` (or
+    ``invoke_url``) is set. A split detector/recognizer pair is supported only
+    when the integrated endpoint is absent.
     """
 
     DEFAULT_INVOKE_URL = "https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-ocr-v2"
@@ -27,10 +29,18 @@ class OCRCPUActor(AbstractOperator, CPUOperator):
     def __init__(self, **ocr_kwargs: Any) -> None:
         super().__init__(**ocr_kwargs)
         self.ocr_kwargs = dict(ocr_kwargs)
-        invoke_url = str(
-            self.ocr_kwargs.get("ocr_invoke_url") or self.ocr_kwargs.get("invoke_url") or self.DEFAULT_INVOKE_URL
-        ).strip()
-        if "invoke_url" not in self.ocr_kwargs:
+        invoke_url = str(self.ocr_kwargs.get("ocr_invoke_url") or self.ocr_kwargs.get("invoke_url") or "").strip()
+        split_remote = bool(
+            str(self.ocr_kwargs.get("line_detector_invoke_url") or "").strip()
+            and str(self.ocr_kwargs.get("ocr_recognizer_invoke_url") or "").strip()
+        )
+        box_remote = bool(
+            self.ocr_kwargs.get("ocr_pipeline") == "pipeline-tesseract"
+            and str(self.ocr_kwargs.get("ocr_recognizer_invoke_url") or "").strip()
+        )
+        if not invoke_url and not (split_remote or box_remote):
+            invoke_url = self.DEFAULT_INVOKE_URL
+        if invoke_url:
             self.ocr_kwargs["invoke_url"] = invoke_url
 
         self.ocr_kwargs["extract_text"] = bool(self.ocr_kwargs.get("extract_text", False))

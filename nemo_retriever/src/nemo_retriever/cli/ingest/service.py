@@ -63,6 +63,7 @@ def _service_command(
     extract_infographics: opts.ExtractInfographicsOption = None,
     extract_page_as_image: opts.ExtractPageAsImageOption = None,
     ocr_version: opts.OcrVersionOption = None,
+    ocr_lang: opts.OcrLangOption = None,
     table_output_format: Annotated[
         TableOutputFormatValue | None,
         typer.Option("--table-output-format", help="Table text format. 'markdown' enables table-structure extraction."),
@@ -119,6 +120,7 @@ def _service_command(
             extract_page_as_image=extract_page_as_image,
             table_output_format=table_output_format,
             ocr_version=ocr_version,
+            ocr_lang=ocr_lang,
         ),
         dedup=ServiceIngestDedupOptions(enabled=dedup, iou_threshold=dedup_iou_threshold),
         caption=ServiceIngestCaptionOptions(

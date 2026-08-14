@@ -9,7 +9,7 @@ import time
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit, urlunsplit
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import requests
 
@@ -286,6 +286,7 @@ class NIMClient:
         invoke_url: str,
         image_b64_list: Sequence[str],
         merge_levels: Optional[Sequence[str]] = None,
+        extra_payload: Optional[Mapping[str, Any]] = None,
         api_key: Optional[str] = None,
         timeout_s: float = 60.0,
         max_batch_size: int = 8,
@@ -319,7 +320,8 @@ class NIMClient:
                 }
                 for b64 in image_b64_list[start:end]
             ]
-            payload: Dict[str, Any] = {"input": inputs}
+            payload: Dict[str, Any] = dict(extra_payload or {})
+            payload["input"] = inputs
             if merge_levels is not None:
                 payload["merge_levels"] = list(merge_levels[start:end])
             response_json = _post_with_retries(
@@ -392,14 +394,26 @@ class NIMClient:
         timeout_s: float = 120.0,
         temperature: float = 0.0,
         extra_body: Optional[Dict[str, Any]] = None,
+        extra_bodies: Optional[Sequence[Mapping[str, Any]]] = None,
         max_retries: int = 10,
         max_429_retries: int = 5,
+        return_metadata: bool = False,
     ) -> List[str]:
-        """Concurrent chat completions using the persistent thread pool."""
+        """Concurrent chat completions using the persistent thread pool.
+
+        ``return_metadata`` is an opt-in extension used by Pipeline 6 to
+        collect vLLM usage counters without changing the legacy string-only
+        return contract.
+        """
         from nemo_retriever.models.nim.chat_completions import extract_chat_completion_text
 
         if not messages_list:
             return []
+        if extra_bodies is not None and len(extra_bodies) != len(messages_list):
+            raise ValueError(
+                "extra_bodies length must match messages_list length "
+                f"({len(extra_bodies)} != {len(messages_list)})"
+            )
 
         token = (api_key or "").strip()
         headers: Dict[str, str] = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -407,10 +421,10 @@ class NIMClient:
             headers["Authorization"] = f"Bearer {token}"
 
         invoke_urls = _parse_invoke_urls(invoke_url)
-        results: List[Optional[str]] = [None] * len(messages_list)
+        results: List[Optional[Any]] = [None] * len(messages_list)
         trace_context = _capture_trace_context()
 
-        def _invoke_one(idx: int, messages: List[Dict[str, Any]], endpoint_url: str) -> Tuple[int, str]:
+        def _invoke_one(idx: int, messages: List[Dict[str, Any]], endpoint_url: str) -> Tuple[int, Any]:
             payload: Dict[str, Any] = {
                 "messages": messages,
                 "temperature": temperature,
@@ -419,6 +433,8 @@ class NIMClient:
                 payload["model"] = model
             if extra_body:
                 payload.update(extra_body)
+            if extra_bodies is not None:
+                payload.update(dict(extra_bodies[idx]))
             response_json = _post_with_retries(
                 invoke_url=endpoint_url,
                 payload=payload,
@@ -428,7 +444,19 @@ class NIMClient:
                 max_429_retries=int(max_429_retries),
                 trace_context=trace_context,
             )
-            return idx, extract_chat_completion_text(response_json)
+            text = extract_chat_completion_text(response_json)
+            if not return_metadata:
+                return idx, text
+            choices = response_json.get("choices") if isinstance(response_json, dict) else None
+            finish_reason = None
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                finish_reason = choices[0].get("finish_reason")
+            usage = response_json.get("usage") if isinstance(response_json, dict) else None
+            return idx, {
+                "text": text,
+                "usage": dict(usage) if isinstance(usage, dict) else {},
+                "finish_reason": finish_reason,
+            }
 
         futures = {
             self._executor.submit(_invoke_one, i, msgs, invoke_urls[i % len(invoke_urls)]): i
@@ -438,6 +466,8 @@ class NIMClient:
             i, text = future.result()
             results[i] = text
 
+        if return_metadata:
+            return [r if isinstance(r, dict) else {"text": str(r or ""), "usage": {}} for r in results]
         return [r if r is not None else "" for r in results]
 
     def invoke_chat_completions_images(
@@ -449,22 +479,36 @@ class NIMClient:
         api_key: Optional[str] = None,
         timeout_s: float = 120.0,
         task_prompt: Optional[str] = None,
+        task_prompts: Optional[Sequence[str]] = None,
         temperature: float = 0.0,
         repetition_penalty: Optional[float] = 1.1,
         extra_body: Optional[Dict[str, Any]] = None,
+        max_tokens_per_request: Optional[Sequence[int]] = None,
         max_retries: int = 10,
         max_429_retries: int = 5,
+        return_metadata: bool = False,
     ) -> List[str]:
         """Chat completions wrapper: one request per base64 image."""
         if not image_b64_list:
             return []
+        if task_prompts is not None and len(task_prompts) != len(image_b64_list):
+            raise ValueError(
+                "task_prompts length must match image_b64_list length "
+                f"({len(task_prompts)} != {len(image_b64_list)})"
+            )
+        if max_tokens_per_request is not None and len(max_tokens_per_request) != len(image_b64_list):
+            raise ValueError(
+                "max_tokens_per_request length must match image_b64_list length "
+                f"({len(max_tokens_per_request)} != {len(image_b64_list)})"
+            )
 
         messages_list: List[List[Dict[str, Any]]] = []
-        for b64 in image_b64_list:
+        for index, b64 in enumerate(image_b64_list):
             mime = _mime_from_b64(b64)
             content: List[Dict[str, Any]] = []
-            if task_prompt:
-                content.append({"type": "text", "text": task_prompt})
+            prompt = task_prompts[index] if task_prompts is not None else task_prompt
+            if prompt:
+                content.append({"type": "text", "text": prompt})
             content.append(
                 {
                     "type": "image_url",
@@ -479,6 +523,14 @@ class NIMClient:
         if extra_body:
             merged_extra.update(extra_body)
 
+        per_request_extra: Optional[list[dict[str, Any]]] = None
+        if max_tokens_per_request is not None:
+            per_request_extra = []
+            for max_tokens in max_tokens_per_request:
+                request_extra = dict(merged_extra)
+                request_extra["max_tokens"] = max(1, int(max_tokens))
+                per_request_extra.append(request_extra)
+
         return self.invoke_chat_completions(
             invoke_url=invoke_url,
             messages_list=messages_list,
@@ -487,8 +539,10 @@ class NIMClient:
             timeout_s=timeout_s,
             temperature=temperature,
             extra_body=merged_extra,
+            extra_bodies=per_request_extra,
             max_retries=max_retries,
             max_429_retries=max_429_retries,
+            return_metadata=return_metadata,
         )
 
     # -- lifecycle --------------------------------------------------------
@@ -513,6 +567,7 @@ def invoke_image_inference_batches(
     invoke_url: str,
     image_b64_list: Sequence[str],
     merge_levels: Optional[Sequence[str]] = None,
+    extra_payload: Optional[Mapping[str, Any]] = None,
     api_key: Optional[str] = None,
     timeout_s: float = 60.0,
     max_batch_size: int = 8,
@@ -533,6 +588,11 @@ def invoke_image_inference_batches(
         ``"paragraph"``).  When provided, must have the same length as
         *image_b64_list*.  Passed as ``merge_levels`` in the JSON payload
         so the NIM can apply per-crop merging behaviour.
+    extra_payload
+        Optional request fields merged into each batch payload.  This is used
+        by compatible sidecars such as Tesseract for request-scoped language
+        and page-segmentation settings; the image ``input`` and
+        ``merge_levels`` fields remain owned by this transport.
 
     Returns one response item per input image, in the same order.
 
@@ -547,6 +607,7 @@ def invoke_image_inference_batches(
             invoke_url=invoke_url,
             image_b64_list=image_b64_list,
             merge_levels=merge_levels,
+            extra_payload=extra_payload,
             api_key=api_key,
             timeout_s=timeout_s,
             max_batch_size=max_batch_size,

@@ -145,7 +145,10 @@ def test_extract_unified_defaults() -> None:
     """`.extract()` defaults: infer extraction_mode at graph-build time and no chunking unless opted in."""
     ingestor = GraphIngestor(run_mode="inprocess").extract()
     assert ingestor._extraction_mode is None
-    assert all(ingestor._split_config[k] is None for k in ("text", "html", "pdf", "audio", "image", "video"))
+    assert all(
+        ingestor._split_config[k] is None
+        for k in ("text", "html", "pdf", "spreadsheet", "audio", "image", "video")
+    )
 
 
 def test_extract_rejects_unknown_kwargs() -> None:

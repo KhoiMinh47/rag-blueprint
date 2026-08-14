@@ -70,7 +70,9 @@ from nemo_retriever.service.services.proxy import get_proxy
 from nemo_retriever.service.services.worker_result_store import (
     ResultStoreTemporarilyUnavailable,
     get_result_data,
+    get_visual_evidence,
     store_result_data,
+    store_visual_evidence,
 )
 from nemo_retriever.service.utils.file_type import (
     FileCategory,
@@ -355,6 +357,46 @@ async def _pull_and_store_worker_result(
         ) from exc
 
 
+async def _pull_and_store_worker_visual(
+    request: Request,
+    document_id: str,
+    worker_ip: Any,
+    callback_worker_ip: Any = None,
+) -> None:
+    """Copy compact visual evidence from the completing worker."""
+    url = _worker_result_url(request, document_id, worker_ip, callback_worker_ip)
+    try:
+        async with httpx.AsyncClient(timeout=30.0, headers=_internal_auth_headers(request)) as client:
+            response = await client.get(url)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Unable to fetch visual evidence for {document_id!r} from its worker",
+            headers={"Retry-After": "1"},
+        ) from exc
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Worker returned HTTP {response.status_code} for visual evidence {document_id!r}",
+            headers={"Retry-After": "1"},
+        )
+    try:
+        payload = response.json()
+        evidence = payload.get("visual_evidence") if isinstance(payload, dict) else None
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=f"Worker returned invalid visual evidence for {document_id!r}") from exc
+    if not isinstance(evidence, dict):
+        raise HTTPException(status_code=503, detail=f"Worker returned no visual evidence for {document_id!r}")
+    try:
+        await asyncio.to_thread(store_visual_evidence, document_id, evidence)
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Unable to retain visual evidence for {document_id!r} on the gateway",
+            headers={"Retry-After": "1"},
+        ) from exc
+
+
 async def _gateway_enqueue(
     request: Request,
     pool_type: PoolType,
@@ -444,6 +486,8 @@ def _route_by_page_count(
       heavyweight ASR / frame-extraction pipelines.
     * Image files are always routed to **realtime** — they are single-page
       and latency-sensitive.
+    * Spreadsheet files are routed to **realtime** — their logical pages are
+      workbook sheets, not PDF pages, and native parsing is CPU-bound.
     * Documents (PDF, DOCX, PPTX) and other types use the original
       page-count heuristic: small docs (<threshold pages) go to realtime,
       larger ones to batch.
@@ -456,6 +500,8 @@ def _route_by_page_count(
     if file_category in (FileCategory.AUDIO, FileCategory.VIDEO):
         return PoolType.BATCH
     if file_category == FileCategory.IMAGE:
+        return PoolType.REALTIME
+    if file_category == FileCategory.SPREADSHEET:
         return PoolType.REALTIME
     if meta.page_number is not None:
         return PoolType.REALTIME
@@ -479,17 +525,56 @@ def _build_policy(request: Request):  # -> PipelineOverridesPolicy
 
 
 def _resolve_pipeline_spec(request: Request, meta: IngestRequest) -> PipelineSpec | None:
-    """Validate ``meta.pipeline`` against the service's override policy.
+    """Resolve the upload UI OCR selector and validate the pipeline spec.
 
-    Returns ``None`` when the spec is missing or empty so the worker
-    short-circuits to the legacy startup-baked pipeline. Raises
-    :class:`HTTPException` (the FastAPI-native error) for policy denials.
+    The dashboard sends ``ocr_pipeline`` in the existing free-form metadata
+    object so older clients remain compatible.  Convert that value into the
+    typed ``PipelineSpec`` before forwarding the work item; endpoint wiring
+    stays server-owned and is selected later inside the worker.
     """
-    if meta.pipeline is None:
+    selected = meta.metadata.get("ocr_pipeline") if isinstance(meta.metadata, dict) else None
+    if selected is not None and (
+        not isinstance(selected, str)
+        or selected
+        not in {
+            "pipeline-nemotron-ocr",
+            "pipeline-ppocrv6",
+            "pipeline-tesseract",
+            "pipeline-option3",
+            "pipeline-option4",
+            "pipeline-option5",
+            "pipeline-option6",
+            "pipeline-option7",
+        }
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "metadata.ocr_pipeline must be one of "
+                "'pipeline-nemotron-ocr', 'pipeline-ppocrv6', 'pipeline-tesseract', "
+                "'pipeline-option3', 'pipeline-option4', 'pipeline-option5', "
+                "'pipeline-option6' or "
+                "'pipeline-option7'"
+            ),
+        )
+
+    spec = meta.pipeline
+    if selected is not None:
+        if spec is None:
+            spec = PipelineSpec(ocr_pipeline=selected)
+        elif spec.ocr_pipeline is not None and spec.ocr_pipeline != selected:
+            raise HTTPException(
+                status_code=400,
+                detail="metadata.ocr_pipeline conflicts with pipeline.ocr_pipeline",
+            )
+        else:
+            spec = spec.model_copy(update={"ocr_pipeline": selected})
+
+    if spec is None:
         return None
     policy = _build_policy(request)
     try:
-        return validate_pipeline_spec(meta.pipeline, policy)
+        return validate_pipeline_spec(spec, policy)
     except PolicyError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
@@ -724,6 +809,7 @@ def _document_to_response(rec, *, result_data=None) -> DocumentStatusResponse:
         result_rows=rec.result_rows,
         result_data=result_data,
         error=rec.error,
+        pipeline_diagnostics=rec.pipeline_diagnostics,
     )
 
 
@@ -1278,6 +1364,7 @@ async def _status_response(request: Request, item_id: str) -> JSONResponse:
         result_rows=rec.result_rows,
         result_data=result_data,
         error=rec.error,
+        pipeline_diagnostics=rec.pipeline_diagnostics,
     ).model_dump()
 
     if is_terminal:
@@ -1712,21 +1799,22 @@ async def query(request: Request) -> Response:
     include_in_schema=False,
 )
 async def worker_document_result(document_id: str) -> JSONResponse:
-    """Return rows stored by the worker pool after pipeline completion."""
+    """Return rows and/or visual evidence stored by a worker."""
     try:
         rows = get_result_data(document_id)
+        visual_evidence = get_visual_evidence(document_id)
     except ResultStoreTemporarilyUnavailable as exc:
         raise HTTPException(
             status_code=503,
             detail=str(exc),
             headers={"Retry-After": str(_RESULT_RETRY_AFTER_SECONDS)},
         ) from exc
-    if rows is None:
+    if rows is None and visual_evidence is None:
         raise HTTPException(
             status_code=404,
-            detail=f"No cached result rows for document {document_id!r}",
+            detail=f"No cached result payload for document {document_id!r}",
         )
-    return JSONResponse({"id": document_id, "result_data": rows})
+    return JSONResponse({"id": document_id, "result_data": rows, "visual_evidence": visual_evidence})
 
 
 @router.post(
@@ -1791,9 +1879,11 @@ async def job_callback(request: Request) -> JSONResponse:
             item_id,
             body.get("error", "unknown error"),
             elapsed_s=body.get("elapsed_s"),
+            pipeline_diagnostics=body.get("pipeline_diagnostics"),
         )
     else:
         result_rows = body.get("result_rows", 0)
+        visual_worker_ip = body.get("visual_worker_ip")
         if pre_rec is None and result_rows and body.get("result_worker_ip"):
             logger.warning(
                 "Permanently rejecting retained result handoff for unknown document %s",
@@ -1802,6 +1892,15 @@ async def job_callback(request: Request) -> JSONResponse:
             raise HTTPException(
                 status_code=410,
                 detail=f"Gateway has no tracked document {item_id!r} for retained result handoff",
+            )
+        if pre_rec is None and visual_worker_ip:
+            logger.warning(
+                "Permanently rejecting visual evidence handoff for unknown document %s",
+                item_id,
+            )
+            raise HTTPException(
+                status_code=410,
+                detail=f"Gateway has no tracked document {item_id!r} for visual evidence handoff",
             )
         if pre_rec is not None and result_rows and tracker.should_retain_results(pre_rec.job_id):
             try:
@@ -1824,10 +1923,32 @@ async def job_callback(request: Request) -> JSONResponse:
                     owner_ip,
                     body.get("result_worker_ip") if lease_record is not None else None,
                 )
+        if pre_rec is not None and visual_worker_ip:
+            try:
+                retained_visual = await asyncio.to_thread(get_visual_evidence, item_id)
+            except ResultStoreTemporarilyUnavailable as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=str(exc),
+                    headers={"Retry-After": "1"},
+                ) from exc
+            if retained_visual is None:
+                visual_owner_ip = (
+                    lease_record.lease.worker_ip
+                    if lease_record is not None and lease_record.lease
+                    else visual_worker_ip
+                )
+                await _pull_and_store_worker_visual(
+                    request,
+                    item_id,
+                    visual_owner_ip,
+                    visual_worker_ip if lease_record is not None else None,
+                )
         outcome = tracker.mark_completed(
             item_id,
             result_rows=result_rows,
             elapsed_s=body.get("elapsed_s"),
+            pipeline_diagnostics=body.get("pipeline_diagnostics"),
         )
 
     bus = get_event_bus()
@@ -2051,6 +2172,7 @@ def _snapshot_terminal_jobs(tracker: Any, *, job_id: str | None = None) -> list[
             "result_rows": rec.result_rows,
             "elapsed_s": rec.elapsed_s,
             "error": rec.error,
+            "pipeline_diagnostics": rec.pipeline_diagnostics,
         }
         for rec in recs
         if rec.status in terminal
@@ -2102,6 +2224,7 @@ async def ingest_status_batch(request: Request) -> JSONResponse:
                 "result_rows": rec.result_rows,
                 "elapsed_s": rec.elapsed_s,
                 "error": rec.error,
+                "pipeline_diagnostics": rec.pipeline_diagnostics,
             }
 
     terminal_count = sum(

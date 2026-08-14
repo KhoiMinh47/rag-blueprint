@@ -1,0 +1,8 @@
+FROM nemo-retriever-ppocrv6:dev
+
+# PaddleOCR-VL is an optional PaddleX pipeline and is intentionally kept in a
+# separate benchmark image. The production OCR image is not modified.
+RUN pip install --no-cache-dir "paddlex[ocr]==3.7.2"
+
+WORKDIR /opt/ocr_benchmark
+COPY tools/ocr_benchmark/server.py /opt/ocr_benchmark/server.py

@@ -24,7 +24,9 @@ import asyncio
 import json
 import logging
 import multiprocessing as mp
+import os
 import time
+from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from io import BytesIO
@@ -79,6 +81,27 @@ def _params_to_dict(params: Any) -> dict[str, Any]:
 _pipeline_configs: dict[str, dict[str, Any]] = {}
 
 
+class _TransportRows(list[dict[str, Any]]):
+    """JSON rows plus an optional private dashboard visual sidecar.
+
+    The pool contract remains ``(row_count, result_data)`` and ordinary
+    callers still see a normal list.  The sidecar is consumed by the service
+    worker before the list is retained or discarded, so it never appears in
+    public ``result_data``.
+    """
+
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        visual_evidence: dict[str, Any] | None = None,
+        pipeline_diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(rows)
+        self.visual_evidence = visual_evidence
+        self.pipeline_diagnostics = pipeline_diagnostics
+
+
 def get_pipeline_configs() -> dict[str, dict[str, Any]]:
     """Return the captured pipeline configurations (populated at startup)."""
     return _pipeline_configs
@@ -105,6 +128,71 @@ def _sanitize_result_data(
         return_embeddings=return_embeddings,
         return_images=return_images,
     )
+
+
+def _extract_pipeline_diagnostics(df: Any) -> dict[str, Any] | None:
+    """Read compact document diagnostics without retaining result rows."""
+    if not hasattr(df, "iterrows"):
+        return None
+    try:
+        rows = df.iterrows()
+    except Exception:
+        return None
+    selected: dict[str, Any] | None = None
+    for _index, row in rows:
+        try:
+            metadata = row.get("metadata") if hasattr(row, "get") else None
+        except Exception:
+            metadata = None
+        if not isinstance(metadata, Mapping):
+            continue
+        candidate = metadata.get("ocr_document_diagnostics")
+        if not isinstance(candidate, Mapping):
+            timing = metadata.get("ocr_timing")
+            candidate = timing.get("document") if isinstance(timing, Mapping) else None
+        if not isinstance(candidate, Mapping) or candidate.get("scope") != "document":
+            continue
+        value = dict(candidate)
+        # Streaming Pipeline 6 rows carry cumulative snapshots. The last
+        # completed block has the largest page/batch count, while dataframe
+        # order is not guaranteed after parallel PDF rendering. Select that
+        # snapshot; every non-streaming pipeline retains first-match behavior.
+        if value.get("pipeline") == "pipeline-option6" and value.get("streaming_enabled"):
+            current_rank = (
+                int(value.get("stream_batches") or 0),
+                int(value.get("page_count") or 0),
+            )
+            selected_rank = (
+                int((selected or {}).get("stream_batches") or 0),
+                int((selected or {}).get("page_count") or 0),
+            )
+            if selected is None or current_rank > selected_rank:
+                selected = value
+            continue
+        return value
+    return selected
+
+
+def _attach_pipeline_selector(
+    diagnostics: dict[str, Any] | None,
+    pipeline_spec: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Persist the request-scoped OCR selector beside document diagnostics.
+
+    The dashboard deliberately defaults to ``retain_results=false``.  In that
+    mode it cannot recover the selector from result-row metadata, so the
+    selector must travel with the compact diagnostics sidecar instead.  Keep
+    this independent from the OCR implementation: every request-scoped
+    selector is useful to the FE, even when a pipeline does not emit its own
+    Option 5 timing block.
+    """
+    selector = pipeline_spec.get("ocr_pipeline") if pipeline_spec else None
+    if not selector:
+        return diagnostics
+
+    enriched = dict(diagnostics) if isinstance(diagnostics, dict) else {"scope": "document"}
+    enriched.setdefault("ocr_pipeline", str(selector))
+    return enriched
 
 
 def _pipeline_tracing() -> Any | None:
@@ -172,6 +260,58 @@ def _pool_worker_ping(_: int) -> bool:
     from nemo_retriever.models.warmup_registry import is_warmup_active
 
     return is_warmup_active()
+
+
+def _pool_worker_ready(_: int) -> bool:
+    """No-op task used to keep a remote-model process pool warm.
+
+    Option 2 uses remote NIM/VietOCR services, so loading HF models in the
+    child is unnecessary.  We still import the graph and Option 2 modules
+    here because the first real submission otherwise pays their import cost
+    on the document's critical path.  No model is instantiated and no GPU
+    request is made by this function.
+    """
+    from nemo_retriever.graph.executor import InprocessExecutor  # noqa: F401
+    from nemo_retriever.graph.ingestor_runtime import build_graph  # noqa: F401
+    from nemo_retriever.ingestor.graph_ingestor import GraphIngestor  # noqa: F401
+    from nemo_retriever.common.modality.ocr.isolated.option2 import run_option2_batch  # noqa: F401
+
+    return True
+
+
+def _option2_prewarm_enabled() -> bool:
+    """Return whether the service preset requests the Option 2 prewarm."""
+    return os.environ.get("NEMO_RETRIEVER_OPTION2_PREWARM", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def prewarm_remote_process_pool_workers(
+    executor: ProcessPoolExecutor,
+    *,
+    num_workers: int,
+    label: str,
+) -> dict[str, Any]:
+    """Spawn remote-model worker children before the first Option 2 upload."""
+    expected = max(1, int(num_workers))
+    started = time.perf_counter()
+    futures = [executor.submit(_pool_worker_ready, index) for index in range(expected)]
+    ready = 0
+    for future in futures:
+        if future.result(timeout=300):
+            ready += 1
+    status = {
+        "enabled": True,
+        "complete": ready == expected,
+        "workers_expected": expected,
+        "workers_ready": ready,
+        "elapsed_s": round(time.perf_counter() - started, 4),
+    }
+    logger.info("Option 2 %s process-pool prewarm: %s", label, status)
+    return status
 
 
 def _resolve_max_tasks_per_child(local: "LocalModelsConfig") -> int:
@@ -316,11 +456,20 @@ def _post_rows_to_vectordb(rows: list[dict[str, Any]], vectordb_url: str, filena
 _TRUST_OWNED_EXTRACT_KEYS: tuple[str, ...] = (
     "invoke_url",
     "api_key",
+    "official_ppocr_invoke_url",
+    "paddleocr_vl_invoke_url",
     "page_elements_invoke_url",
     "page_elements_api_key",
     "ocr_invoke_url",
+    "line_detector_invoke_url",
+    "ocr_recognizer_invoke_url",
+    "tesseract_ocr_invoke_url",
+    "vintern_ocr_invoke_url",
+    "ministral_vlm_invoke_url",
+    "vietnamese_ocr_invoke_url",
     "ocr_api_key",
     "table_structure_invoke_url",
+    "stamp_detection_invoke_url",
     "nemotron_parse_invoke_url",
 )
 _TRUST_OWNED_EMBED_KEYS: tuple[str, ...] = (
@@ -444,7 +593,8 @@ def _request_needs_asr_params(extraction_mode: str | None, filename: str) -> boo
       ``MultiTypeExtractOperator`` dispatches at row level and only
       needs ASR when the row is actually media.
 
-    Anything else (``"pdf"``, ``"image"``, ``"text"``, ``"html"``, or a
+    Anything else (``"pdf"``, ``"image"``, ``"text"``, ``"html"``,
+    ``"spreadsheet"``, or a
     non-media extension under ``"auto"``) must not pin ASR params.
     """
     mode = (extraction_mode or "").strip().lower()
@@ -528,6 +678,171 @@ def _build_graph_ingestor_from_spec(
     split_config = spec.get("split_config")
 
     extract_kwargs = _merge_server_owned(base_extract, spec.get("extract_params"), _TRUST_OWNED_EXTRACT_KEYS)
+    ocr_pipeline = spec.get("ocr_pipeline")
+    # A client may explicitly request the legacy integrated OCR path even
+    # though the service default is now Pipeline 7.  Reset the inherited
+    # selector before the branch-specific overrides below.
+    if ocr_pipeline == "pipeline-nemotron-ocr":
+        extract_kwargs["ocr_pipeline"] = ocr_pipeline
+    if ocr_pipeline in {"pipeline-ppocrv6", "pipeline-tesseract"}:
+        nim_ocr_url = str(extract_kwargs.get("ocr_invoke_url") or "").strip()
+        vietnamese_url = str(
+            extract_kwargs.get("vietnamese_ocr_invoke_url") or ""
+        ).strip()
+        page_elements_url = str(extract_kwargs.get("page_elements_invoke_url") or "").strip()
+        table_url = str(extract_kwargs.get("table_structure_invoke_url") or "").strip()
+        if not all((nim_ocr_url, vietnamese_url, page_elements_url, table_url)):
+            raise RuntimeError(
+                "pipeline-ppocrv6 (Option 2) requires page-elements, "
+                "table-structure, Nemotron OCR, and a Vietnamese OCR endpoint. "
+                "Configure page_elements_invoke_url, "
+                "table_structure_invoke_url, ocr_invoke_url, "
+                "and vietnamese_ocr_invoke_url."
+            )
+        # Keep the public selector for API/UI compatibility.  Option 2 is an
+        # isolated, independently tunable snapshot of the Option 3 semantic
+        # crop + Nemotron + VietOCR baseline.
+        extract_kwargs["ocr_pipeline"] = "pipeline-ppocrv6"
+        extract_kwargs["ocr_invoke_url"] = nim_ocr_url
+        extract_kwargs["vietnamese_ocr_invoke_url"] = vietnamese_url
+        extract_kwargs["page_elements_invoke_url"] = page_elements_url
+        extract_kwargs["table_structure_invoke_url"] = table_url
+        extract_kwargs["use_page_elements"] = True
+        extract_kwargs["use_table_structure"] = True
+        extract_kwargs["extract_page_as_image"] = True
+        extract_kwargs["method"] = "pdfium_hybrid"
+    elif ocr_pipeline == "pipeline-option3":
+        nemotron_url = str(extract_kwargs.get("ocr_invoke_url") or "").strip()
+        vietnamese_url = str(
+            extract_kwargs.get("vietnamese_ocr_invoke_url") or ""
+        ).strip()
+        if not nemotron_url or not vietnamese_url:
+            raise RuntimeError(
+                "pipeline-option3 requires Nemotron OCR v2 and a Vietnamese "
+                "recognizer endpoint. Set ocr_invoke_url and "
+                "vietnamese_ocr_invoke_url in the service configuration."
+            )
+        extract_kwargs["ocr_pipeline"] = ocr_pipeline
+        extract_kwargs["ocr_invoke_url"] = nemotron_url
+        extract_kwargs["vietnamese_ocr_invoke_url"] = vietnamese_url
+        extract_kwargs["method"] = "pdfium_hybrid"
+    elif ocr_pipeline == "pipeline-option4":
+        detector_url = str(extract_kwargs.get("line_detector_invoke_url") or "").strip()
+        nemotron_url = str(extract_kwargs.get("ocr_invoke_url") or "").strip()
+        tesseract_url = str(extract_kwargs.get("tesseract_ocr_invoke_url") or "").strip()
+        if not detector_url or not nemotron_url or not tesseract_url:
+            raise RuntimeError(
+                "pipeline-option4 requires the configured PP-OCRv6 line detector, "
+                "Nemotron OCR v2 endpoint, and Tesseract OCR endpoint. Set "
+                "line_detector_invoke_url, ocr_invoke_url, and "
+                "tesseract_ocr_invoke_url in the service configuration."
+            )
+        extract_kwargs["ocr_pipeline"] = ocr_pipeline
+        extract_kwargs["method"] = "pdfium_hybrid"
+    elif ocr_pipeline == "pipeline-option5":
+        nemotron_url = str(extract_kwargs.get("ocr_invoke_url") or "").strip()
+        vietnamese_url = str(
+            extract_kwargs.get("vietnamese_ocr_invoke_url") or ""
+        ).strip()
+        if not nemotron_url or not vietnamese_url:
+            raise RuntimeError(
+                "pipeline-option5 requires Nemotron OCR v2 and a Vietnamese "
+                "recognizer endpoint. Set ocr_invoke_url and "
+                "vietnamese_ocr_invoke_url in the service configuration."
+            )
+        extract_kwargs["ocr_pipeline"] = ocr_pipeline
+        extract_kwargs["ocr_invoke_url"] = nemotron_url
+        extract_kwargs["vietnamese_ocr_invoke_url"] = vietnamese_url
+        extract_kwargs["method"] = "pdfium_hybrid"
+        # Option 5 gets its semantic OCR units from Page Elements/Table
+        # Structure and deliberately does not route visual regions.  Keeping
+        # the generic ``extract_images`` default here makes PDFium enumerate
+        # and base64-encode every embedded image object before the document
+        # coordinator can start.  That is redundant for this pipeline and is
+        # pathological for image-heavy PDFs.  Retain the page raster because
+        # it is still the source for detector crops and visual evidence.
+        extract_kwargs["extract_images"] = False
+        extract_kwargs["extract_page_as_image"] = True
+        extract_kwargs["use_page_elements"] = True
+        extract_kwargs["use_table_structure"] = True
+    elif ocr_pipeline == "pipeline-option6":
+        qwen_vlm_url = str(
+            extract_kwargs.get("vintern_ocr_invoke_url") or ""
+        ).strip()
+        page_elements_url = str(
+            extract_kwargs.get("page_elements_invoke_url") or ""
+        ).strip()
+        if not qwen_vlm_url or not page_elements_url:
+            raise RuntimeError(
+                "pipeline-option6 requires the configured Page Elements endpoint "
+                "and Qwen 3.5 VLM endpoint. Set "
+                "page_elements_invoke_url and vintern_ocr_invoke_url."
+            )
+        extract_kwargs["ocr_pipeline"] = ocr_pipeline
+        extract_kwargs["vintern_ocr_invoke_url"] = qwen_vlm_url
+        extract_kwargs["page_elements_invoke_url"] = page_elements_url
+        extract_kwargs["method"] = "pdfium_hybrid"
+        extract_kwargs["extract_text"] = True
+        extract_kwargs["extract_tables"] = True
+        extract_kwargs["extract_charts"] = True
+        extract_kwargs["extract_infographics"] = True
+        # Pipeline 6 gets table geometry from Page Elements and lets Qwen
+        # render the whole table as Markdown. Do not accidentally start or
+        # call the Table Structure sidecar from a base worker config.
+        extract_kwargs["extract_images"] = False
+        extract_kwargs["extract_page_as_image"] = True
+        extract_kwargs["use_page_elements"] = True
+        extract_kwargs["use_table_structure"] = False
+        extract_kwargs["table_structure_invoke_url"] = None
+    elif ocr_pipeline == "pipeline-option7":
+        ministral_url = str(
+            extract_kwargs.get("ministral_vlm_invoke_url") or ""
+        ).strip()
+        page_elements_url = str(
+            extract_kwargs.get("page_elements_invoke_url") or ""
+        ).strip()
+        if not ministral_url or not page_elements_url:
+            raise RuntimeError(
+                "pipeline-option7 requires Page Elements and the "
+                "server-owned Ministral 3B VLM endpoints. Set "
+                "page_elements_invoke_url and ministral_vlm_invoke_url "
+                "in the service configuration."
+            )
+        extract_kwargs["ocr_pipeline"] = ocr_pipeline
+        extract_kwargs["ministral_vlm_invoke_url"] = ministral_url
+        extract_kwargs["page_elements_invoke_url"] = page_elements_url
+        extract_kwargs["table_structure_invoke_url"] = None
+        extract_kwargs["method"] = "pdfium_hybrid"
+        # Pipeline 7 uses Page Elements for semantic/evidence bboxes.
+        # Ministral receives OCR crops only:
+        # semantic text/title/table crops or a full page for scan/layout recall.
+        # Page Elements visual detections are kept as evidence and never become
+        # a separate VLM image-crop request.
+        # PDFium text remains available as the native source on pages where it
+        # is complete; scan/layout pages use the bounded full-page fallback.
+        extract_kwargs["extract_text"] = True
+        extract_kwargs["extract_tables"] = True
+        extract_kwargs["extract_charts"] = True
+        extract_kwargs["extract_infographics"] = True
+        extract_kwargs["extract_images"] = False
+        extract_kwargs["extract_page_as_image"] = True
+        extract_kwargs["use_page_elements"] = True
+        extract_kwargs["use_table_structure"] = False
+        # Pipeline 7 is fully owned by Page Elements + Ministral. Do not leak
+        # the base Nemotron/Vintern/PP-OCR endpoints into the graph.
+        for legacy_ocr_key in (
+            "official_ppocr_invoke_url",
+            "paddleocr_vl_invoke_url",
+            "ocr_invoke_url",
+            "line_detector_invoke_url",
+            "ocr_recognizer_invoke_url",
+            "tesseract_ocr_invoke_url",
+            "vintern_ocr_invoke_url",
+            "vietnamese_ocr_invoke_url",
+        ):
+            extract_kwargs[legacy_ocr_key] = None
+    elif ocr_pipeline not in (None, "pipeline-nemotron-ocr"):
+        raise RuntimeError(f"Unsupported OCR pipeline selector: {ocr_pipeline!r}")
     extract_params = ExtractParams(**extract_kwargs)
 
     embed_override = spec.get("embed_params")
@@ -684,8 +999,13 @@ def _run_pipeline_in_process(
         "pool": (pool_label or "").lower(),
         "document.filename": filename,
     }
+    option2_timing = bool((pipeline_spec or {}).get("ocr_pipeline") == "pipeline-ppocrv6")
+    previous_option2_timing = os.environ.get("NEMO_RETRIEVER_OPTION2_TIMING")
+    if option2_timing:
+        os.environ["NEMO_RETRIEVER_OPTION2_TIMING"] = "true"
     try:
         with tracing.start_span("pipeline.ingest", context=span_context, attributes=span_attributes):
+            graph_started = time.perf_counter() if option2_timing else 0.0
             ingestor, _extraction_mode, has_per_request_vdb = _build_graph_ingestor_from_spec(
                 filename,
                 payload,
@@ -695,14 +1015,31 @@ def _run_pipeline_in_process(
                 caption_params_dict,
                 asr_params_dict,
             )
+            if option2_timing:
+                print(
+                    "Option 2 graph construction: "
+                    f"elapsed={time.perf_counter() - graph_started:.4f}s",
+                    flush=True,
+                )
 
+            ingest_started = time.perf_counter() if option2_timing else 0.0
             result_df = ingestor.ingest()
+            if option2_timing:
+                print(
+                    "Option 2 graph ingest: "
+                    f"elapsed={time.perf_counter() - ingest_started:.4f}s rows={len(result_df)}",
+                    flush=True,
+                )
     finally:
         tracing.force_flush(timeout_millis=500)
-
-    elapsed = time.monotonic() - t0
+        if option2_timing:
+            if previous_option2_timing is None:
+                os.environ.pop("NEMO_RETRIEVER_OPTION2_TIMING", None)
+            else:
+                os.environ["NEMO_RETRIEVER_OPTION2_TIMING"] = previous_option2_timing
 
     row_count = len(result_df)
+    postprocess_started = time.perf_counter() if option2_timing else 0.0
 
     from nemo_retriever.service.utils.file_type import is_text_like_filename
 
@@ -722,15 +1059,54 @@ def _run_pipeline_in_process(
 
         lancedb_rows = build_lancedb_rows(result_df)
         _post_rows_to_vectordb(lancedb_rows, vectordb_url, filename)
+    if option2_timing:
+        print(
+            "Option 2 VectorDB sink: "
+            f"elapsed={time.perf_counter() - postprocess_started:.4f}s",
+            flush=True,
+        )
 
     result_options = pipeline_spec or {}
-    result_schema = result_options.get("result_schema", "legacy")
-    result_data = _sanitize_result_data(
-        result_df,
-        result_schema=result_schema,
-        return_embeddings=bool(result_options.get("return_embeddings", False)),
-        return_images=bool(result_options.get("return_images", False)),
+    pipeline_diagnostics = _attach_pipeline_selector(
+        _extract_pipeline_diagnostics(result_df),
+        result_options,
     )
+    retain_transport_rows = bool(result_options.get("_service_retain_results", True))
+    visual_requested = bool(result_options.get("visual_evidence", False))
+    if retain_transport_rows:
+        result_schema = result_options.get("result_schema", "legacy")
+        result_data: list[dict[str, Any]] | _TransportRows = _sanitize_result_data(
+            result_df,
+            result_schema=result_schema,
+            return_embeddings=bool(result_options.get("return_embeddings", False)),
+            return_images=bool(result_options.get("return_images", False)),
+        )
+    else:
+        # The pool still needs a list-like value to carry private sidecars,
+        # but an empty list avoids sanitizing and pickling rows the tracker
+        # will discard anyway.
+        result_data = []
+    if visual_requested:
+        from nemo_retriever.service.services.visual_evidence import build_visual_evidence
+
+        result_data = _TransportRows(
+            list(result_data),
+            visual_evidence=build_visual_evidence(result_df),
+            pipeline_diagnostics=pipeline_diagnostics,
+        )
+    elif pipeline_diagnostics is not None:
+        result_data = _TransportRows(
+            result_data,
+            pipeline_diagnostics=pipeline_diagnostics,
+        )
+    elapsed = time.monotonic() - t0
+    if option2_timing:
+        print(
+            "Option 2 result materialization: "
+            f"elapsed={time.perf_counter() - postprocess_started:.4f}s "
+            f"total={elapsed:.4f}s",
+            flush=True,
+        )
     return row_count, result_data, elapsed
 
 
@@ -782,15 +1158,86 @@ def build_extract_params(nim: "NimEndpointsConfig", local: "LocalModelsConfig | 
     kwargs: dict[str, Any] = {}
     if nim.page_elements_invoke_url:
         kwargs["page_elements_invoke_url"] = nim.page_elements_invoke_url
+    if nim.official_ppocr_invoke_url:
+        kwargs["official_ppocr_invoke_url"] = nim.official_ppocr_invoke_url
+    if nim.paddleocr_vl_invoke_url:
+        kwargs["paddleocr_vl_invoke_url"] = nim.paddleocr_vl_invoke_url
     if nim.ocr_invoke_url:
         kwargs["ocr_invoke_url"] = nim.ocr_invoke_url
+    if nim.line_detector_invoke_url:
+        kwargs["line_detector_invoke_url"] = nim.line_detector_invoke_url
+    if nim.ocr_recognizer_invoke_url:
+        kwargs["ocr_recognizer_invoke_url"] = nim.ocr_recognizer_invoke_url
+    if nim.tesseract_ocr_invoke_url:
+        kwargs["tesseract_ocr_invoke_url"] = nim.tesseract_ocr_invoke_url
+    if nim.vintern_ocr_invoke_url:
+        kwargs["vintern_ocr_invoke_url"] = nim.vintern_ocr_invoke_url
+    if nim.ministral_vlm_invoke_url:
+        kwargs["ministral_vlm_invoke_url"] = nim.ministral_vlm_invoke_url
+    if nim.vietnamese_ocr_invoke_url:
+        kwargs["vietnamese_ocr_invoke_url"] = nim.vietnamese_ocr_invoke_url
     if nim.table_structure_invoke_url:
         kwargs["table_structure_invoke_url"] = nim.table_structure_invoke_url
+    if nim.stamp_detection_invoke_url:
+        kwargs["stamp_detection_invoke_url"] = nim.stamp_detection_invoke_url
+    if nim.stamp_detection_min_score is not None:
+        kwargs["stamp_detection_min_score"] = nim.stamp_detection_min_score
     if nim.api_key:
         kwargs["api_key"] = nim.api_key
 
+    # PDFium remains the native reader, but the service must automatically
+    # fall back to OCR for image-only/scanned pages.  ``pdfium_hybrid`` keeps
+    # native text for normal pages and marks scanned pages for the OCR stage.
+    # Only enable this default when an OCR implementation is actually
+    # available; otherwise a plain service deployment must remain native-only.
+    if (
+        nim.official_ppocr_invoke_url
+        or nim.paddleocr_vl_invoke_url
+        or nim.vintern_ocr_invoke_url
+        or nim.ministral_vlm_invoke_url
+        or
+        nim.ocr_invoke_url
+        or (nim.line_detector_invoke_url and nim.ocr_recognizer_invoke_url)
+        or (nim.line_detector_invoke_url and nim.tesseract_ocr_invoke_url)
+        or (nim.ocr_invoke_url and nim.vietnamese_ocr_invoke_url)
+        or (local.enabled and local.extract.enabled)
+    ):
+        kwargs["method"] = "pdfium_hybrid"
+
+    # The configured Ministral sidecar is the server-owned Pipeline 7 OCR
+    # default. Keep the public selector optional for older clients, but make
+    # server-owned ingest use Page Elements + Ministral OCR.
+    if nim.ministral_vlm_invoke_url:
+        kwargs["ocr_pipeline"] = "pipeline-option7"
+        kwargs["method"] = "pdfium_hybrid"
+        kwargs["extract_page_as_image"] = True
+        kwargs["extract_images"] = False
+        kwargs["use_page_elements"] = True
+        kwargs["extract_text"] = True
+        kwargs["extract_tables"] = True
+        kwargs["extract_charts"] = True
+        kwargs["extract_infographics"] = True
+        kwargs["use_table_structure"] = False
+        kwargs["table_structure_invoke_url"] = None
+        # P7 must not probe or route through any legacy OCR recognizer. The
+        # explicit Ministral endpoint is the only OCR backend; Page Elements
+        # and no Table Structure sidecar is used.
+        for legacy_ocr_key in (
+            "official_ppocr_invoke_url",
+            "paddleocr_vl_invoke_url",
+            "ocr_invoke_url",
+            "line_detector_invoke_url",
+            "ocr_recognizer_invoke_url",
+            "tesseract_ocr_invoke_url",
+            "vietnamese_ocr_invoke_url",
+        ):
+            kwargs[legacy_ocr_key] = None
     if local.enabled and local.extract.enabled:
-        if local.extract.use_table_structure and not nim.table_structure_invoke_url:
+        if (
+            local.extract.use_table_structure
+            and not nim.table_structure_invoke_url
+            and not nim.ministral_vlm_invoke_url
+        ):
             kwargs["use_table_structure"] = True
         if not nim.ocr_invoke_url:
             kwargs["ocr_version"] = local.extract.ocr_version
@@ -925,6 +1372,16 @@ def _make_work_fn(
         warmup_spec_json=warmup_spec_json,
     )
     _process_executors.append(executor)
+    # The development Option 2 stack uses remote model sidecars.  Pre-spawn
+    # only its batch pool so forkserver/import overhead is paid at service
+    # startup instead of inside the first document's latency budget.  The
+    # env gate keeps every other pipeline's startup and pool semantics intact.
+    if label.lower() == "batch" and _option2_prewarm_enabled():
+        prewarm_remote_process_pool_workers(
+            executor,
+            num_workers=num_workers,
+            label=label,
+        )
     if warmup_spec_json:
         _executor_warmup_targets.append((executor, num_workers))
 
@@ -977,6 +1434,14 @@ def _make_work_fn(
         loop = asyncio.get_running_loop()
 
         resolved_spec = _resolve_sidecar_in_spec(item.pipeline_spec)
+        # The FE normally creates jobs with retain_results=False.  Keep the
+        # compact diagnostics/visual sidecars and row count, but do not
+        # serialize the full sanitized result frame through the process pool
+        # when the tracker will discard it anyway.  This applies to every
+        # request-scoped pipeline, not only Option 2.
+        if resolved_spec:
+            resolved_spec = dict(resolved_spec)
+            resolved_spec["_service_retain_results"] = bool(item.retain_results)
 
         try:
             trace_context = _capture_trace_context_for_pipeline()
@@ -1016,6 +1481,12 @@ def _make_work_fn(
             )
             executor_ref[0] = new_executor
             _process_executors.append(new_executor)
+            if label.lower() == "batch" and _option2_prewarm_enabled():
+                prewarm_remote_process_pool_workers(
+                    new_executor,
+                    num_workers=num_workers,
+                    label=label,
+                )
             if warmup_spec_json:
                 _executor_warmup_targets.clear()
                 _executor_warmup_targets.append((new_executor, num_workers))

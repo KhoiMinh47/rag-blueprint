@@ -72,7 +72,16 @@ class OCRActor(ArchetypeOperator):
     @classmethod
     def prefers_cpu_variant(cls, operator_kwargs: dict[str, Any] | None = None) -> bool:
         kwargs = operator_kwargs or {}
-        return bool(str(kwargs.get("ocr_invoke_url") or kwargs.get("invoke_url") or "").strip())
+        legacy_remote = bool(str(kwargs.get("ocr_invoke_url") or kwargs.get("invoke_url") or "").strip())
+        split_remote = bool(
+            str(kwargs.get("line_detector_invoke_url") or "").strip()
+            and str(kwargs.get("ocr_recognizer_invoke_url") or "").strip()
+        )
+        box_remote = bool(
+            kwargs.get("ocr_pipeline") == "pipeline-tesseract"
+            and str(kwargs.get("ocr_recognizer_invoke_url") or "").strip()
+        )
+        return legacy_remote or split_remote or box_remote
 
     @classmethod
     def cpu_variant_class(cls):
@@ -106,8 +115,8 @@ def resolve_ocr_archetype(extract_params: Any) -> type:
             older callers that expected version-specific archetype selection.
 
     Returns:
-        The unified OCR archetype class. The concrete local model version is
-        selected by ``ocr_version``/``ocr_lang`` in the actor kwargs.
+        The unified OCR archetype class. Nemotron OCR v2 is the primary
+        production backend; split detector/recognizer services are optional.
     """
     return OCRActor
 

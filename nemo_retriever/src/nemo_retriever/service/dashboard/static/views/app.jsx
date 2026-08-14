@@ -15,7 +15,7 @@ function parseHash() {
     const jobId = raw.slice(4);
     if (jobId) return { view: 'job_detail', jobId };
   }
-  if (['overview', 'jobs', 'vdb'].includes(raw)) {
+  if (['overview', 'jobs', 'vdb', 'ingest'].includes(raw)) {
     return { view: raw, jobId: null };
   }
   return { view: 'overview', jobId: null };
@@ -53,8 +53,10 @@ function App() {
     content = React.createElement(JobDetailView, { jobId: route.jobId, onBack: backToJobs });
   } else if (route.view === 'vdb' && typeof VdbView !== 'undefined') {
     content = React.createElement(VdbView);
+  } else if (route.view === 'ingest' && typeof IngestDebugView !== 'undefined') {
+    content = React.createElement(IngestDebugView);
   } else {
-    content = React.createElement('div', { className: 'empty-state' }, 'Loading view…');
+    content = React.createElement('div', { className: 'empty-state' }, 'Đang tải màn hình…');
   }
 
   // Map the detail route back onto the "jobs" sidebar entry so the
@@ -64,10 +66,38 @@ function App() {
     view: sidebarView,
     onNavigate: navigate,
     breadcrumb: route.view === 'job_detail'
-      ? { label: `Job ${route.jobId.substring(0, 12)}…`, parent: 'Jobs' }
+      ? { label: `Job ${route.jobId.substring(0, 12)}…`, parent: 'Danh sách job' }
       : null,
   }, content);
 }
 
+class DashboardErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error) {
+    window.__nemoDashboardError = String(error && (error.stack || error.message) || error);
+  }
+
+  render() {
+    if (this.state.error) {
+      return React.createElement('div', {
+        style: { padding: 32, color: '#ff5050', background: '#0e0e0e', minHeight: '100vh', fontFamily: 'system-ui' },
+      },
+        React.createElement('h2', { style: { marginBottom: 12 } }, 'Lỗi khi dựng dashboard'),
+        React.createElement('pre', { style: { whiteSpace: 'pre-wrap', color: '#e0e0e0' } }, String(this.state.error.stack || this.state.error.message || this.state.error)),
+      );
+    }
+    return this.props.children;
+  }
+}
+
 const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(React.createElement(App));
+root.render(React.createElement(DashboardErrorBoundary, null, React.createElement(App)));
+window.__nemoDashboardReady = true;

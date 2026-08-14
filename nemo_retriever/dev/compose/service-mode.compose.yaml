@@ -7,7 +7,52 @@ name: nemo-retriever-service-dev
 # Development-only service-mode stack. Production deployments use Helm.
 x-retriever-image: &retriever-image
   image: ${NEMO_RETRIEVER_IMAGE:-nemo-retriever-service:dev}
-  build: {context: ../../.., dockerfile: Dockerfile, target: service}
+  build:
+    context: ../../..
+    dockerfile: Dockerfile
+    target: service
+    cache_from:
+      - type=local,src=../../../cache/docker/retriever-build
+    cache_to:
+      - type=local,dest=../../../cache/docker/retriever-build,mode=max
+x-ppocr-image: &ppocr-image
+  image: ${PPOCRV6_IMAGE:-nemo-retriever-ppocrv6:dev}
+  build:
+    context: ../../..
+    dockerfile: Dockerfile
+    target: ppocrv6
+    cache_from:
+      - type=local,src=../../../cache/docker/ppocrv6-build
+    cache_to:
+      - type=local,dest=../../../cache/docker/ppocrv6-build,mode=max
+x-tesseract-image: &tesseract-image
+  image: ${TESSERACT_IMAGE:-nemo-retriever-tesseract:dev}
+  build:
+    context: ../../..
+    dockerfile: Dockerfile
+    target: tesseract
+    cache_from:
+      - type=local,src=../../../cache/docker/tesseract-build
+    cache_to:
+      - type=local,dest=../../../cache/docker/tesseract-build,mode=max
+x-vintern-image: &vintern-image
+  # Reuse the already-built GPU runtime image. Vintern is a separate vLLM
+  # container, so no new CUDA/runtime image is downloaded for this service.
+  image: ${VINTERN_IMAGE:-nemo-retriever-service-gpu:dev}
+x-vietocr-image: &vietocr-image
+  image: ${VIETOCR_IMAGE:-nemo-retriever-vietocr:dev}
+  build:
+    context: ../../..
+    dockerfile: Dockerfile
+    target: vietocr
+    cache_from:
+      - type=local,src=../../../cache/docker/vietocr-build
+    cache_to:
+      - type=local,dest=../../../cache/docker/vietocr-build,mode=max
+x-paddleocr-vl-api-image: &paddleocr-vl-api-image
+  image: ${PADDLEOCR_VL_API_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:latest-nvidia-gpu-sm120-offline}
+x-paddleocr-vl-vlm-image: &paddleocr-vl-vlm-image
+  image: ${PADDLEOCR_VL_VLM_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu-sm120-offline}
 x-host-access: &host-access
   extra_hosts: ["host.docker.internal:host-gateway"]
 x-nim-environment: &nim-environment
@@ -36,12 +81,26 @@ x-nim-gpu: &nim-gpu
 services:
   retriever:
     <<: [*retriever-image, *host-access]
+    group_add: ["${DOCKER_GID:-976}"]
+    command:
+      - uvicorn
+      - nemo_retriever.service.dev_entrypoints:create_retriever_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "7670"
+      - --timeout-graceful-shutdown
+      - "30"
     ports: ["${RETRIEVER_HTTP_PORT:-7670}:7670"]
     environment:
-      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      # Hosted OCR/embedding clients read NVIDIA_API_KEY.  NGC_API_KEY is
+      # also accepted by the CPU embedding operator, so carry it through
+      # when callers export only the standard NGC credential.
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-${NGC_API_KEY:-}}
       NEMO_RETRIEVER_LLM_API_KEY: ${ANSWER_LLM_API_KEY:-${NGC_API_KEY:-}}
       AUDIO_GRPC_ENDPOINT: ${NIM_AUDIO_GRPC_ENDPOINT:-}
-      INSTALL_FFMPEG: ${INSTALL_FFMPEG:-false}
+      INSTALL_FFMPEG: ${INSTALL_FFMPEG:-true}
       OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-true}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-nemo-retriever-service}
@@ -51,11 +110,53 @@ services:
       OTEL_PROPAGATORS: ${OTEL_PROPAGATORS:-tracecontext,baggage}
       OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-service.namespace=nemo-retriever,service.role=standalone}
       OTEL_PYTHON_EXCLUDED_URLS: ${OTEL_PYTHON_EXCLUDED_URLS:-health}
+      OPTION2_GPU_SCHEDULER_ENABLED: ${OPTION2_GPU_SCHEDULER_ENABLED:-false}
+      OPTION2_GPU_VRAM_LIMIT_MIB: ${OPTION2_GPU_VRAM_LIMIT_MIB:-30720}
+      OPTION2_COMPOSE_PROJECT: ${OPTION2_COMPOSE_PROJECT:-nemo-retriever-service-dev}
+      # Option 2 uses remote model sidecars; pre-spawn its batch worker so
+      # forkserver/import overhead is outside the document latency budget.
+      NEMO_RETRIEVER_OPTION2_PREWARM: ${NEMO_RETRIEVER_OPTION2_PREWARM:-true}
+      NEMO_RETRIEVER_OPTION2_NEMOTRON_BATCH_SIZE: ${NEMO_RETRIEVER_OPTION2_NEMOTRON_BATCH_SIZE:-8}
+      # Pipeline 6 tuning is server-owned and isolated from pipelines 1–5/7.
+      # Keep these values in the external Option 6 env-file so benchmark runs
+      # do not require editing Python or this compose file.
+      OPTION6_MODEL: ${OPTION6_MODEL:-AxionML/Qwen3.5-2B-NVFP4}
+      OPTION6_DETECTOR_BATCH_SIZE: ${OPTION6_DETECTOR_BATCH_SIZE:-128}
+      OPTION6_DETECTOR_MAX_POOL_WORKERS: ${OPTION6_DETECTOR_MAX_POOL_WORKERS:-1}
+      OPTION6_PAGE_ELEMENTS_WORKERS: ${OPTION6_PAGE_ELEMENTS_WORKERS:-1}
+      OPTION6_CROP_BATCH_SIZE: ${OPTION6_CROP_BATCH_SIZE:-128}
+      OPTION6_CROP_MAX_CONCURRENCY: ${OPTION6_CROP_MAX_CONCURRENCY:-4}
+      OPTION6_CROP_IMAGE_FORMAT: ${OPTION6_CROP_IMAGE_FORMAT:-JPEG}
+      OPTION6_CROP_JPEG_QUALITY: ${OPTION6_CROP_JPEG_QUALITY:-95}
+      OPTION6_VLM_BATCH_SIZE: ${OPTION6_VLM_BATCH_SIZE:-8}
+      OPTION6_VLM_MAX_CONCURRENCY: ${OPTION6_VLM_MAX_CONCURRENCY:-8}
+      OPTION6_VLM_MAX_OUTPUT_TOKENS_TEXT: ${OPTION6_VLM_MAX_OUTPUT_TOKENS_TEXT:-4096}
+      OPTION6_VLM_MAX_OUTPUT_TOKENS_TABLE: ${OPTION6_VLM_MAX_OUTPUT_TOKENS_TABLE:-4096}
+      OPTION6_VLM_MAX_OUTPUT_TOKENS_VISUAL: ${OPTION6_VLM_MAX_OUTPUT_TOKENS_VISUAL:-32}
+      OPTION6_PROMPT_PROFILE: ${OPTION6_PROMPT_PROFILE:-word_repair}
+      # PDFium-text -> Markdown lost table-column fidelity in the native A/B
+      # check; keep it opt-in until a new quality gate passes.
+      OPTION6_NATIVE_TABLE_TEXT_ENABLED: ${OPTION6_NATIVE_TABLE_TEXT_ENABLED:-false}
+      OPTION6_NATIVE_TABLE_MIN_CHARS: ${OPTION6_NATIVE_TABLE_MIN_CHARS:-8}
+      OPTION6_PDF_SPLIT_BATCH_SIZE: ${OPTION6_PDF_SPLIT_BATCH_SIZE:-1}
+      OPTION6_PDF_EXTRACT_BATCH_SIZE: ${OPTION6_PDF_EXTRACT_BATCH_SIZE:-16}
+      OPTION6_PDF_EXTRACT_WORKERS: ${OPTION6_PDF_EXTRACT_WORKERS:-4}
+      OPTION6_PDF_EXTRACT_CPUS: ${OPTION6_PDF_EXTRACT_CPUS:-2.0}
+      OPTION6_STREAMING_ENABLED: ${OPTION6_STREAMING_ENABLED:-true}
+      OPTION6_STREAM_BATCH_SIZE: ${OPTION6_STREAM_BATCH_SIZE:-16}
+      OPTION6_STREAM_QUEUE_BLOCKS: ${OPTION6_STREAM_QUEUE_BLOCKS:-2}
+      OPTION6_SCAN_FULL_PAGE: ${OPTION6_SCAN_FULL_PAGE:-true}
+      OPTION6_SCAN_MASK_LAYOUT: ${OPTION6_SCAN_MASK_LAYOUT:-true}
+      OPTION6_VISUAL_VLM: ${OPTION6_VISUAL_VLM:-true}
     configs:
       - {source: retriever_service_config, target: /etc/nemo-retriever/retriever-service.yaml, mode: 0444}
-    volumes: [retriever_data:/var/lib/nemo-retriever]
+    volumes:
+      - ../../../:/workspace:rw
+      - ../../../cache/retriever:/var/lib/nemo-retriever:rw
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       vectordb: {condition: service_healthy}
+      paddleocr-vl-api: {condition: service_healthy, required: false}
       nim-page-elements: {condition: service_healthy, required: false}
       nim-table-structure: {condition: service_healthy, required: false}
       nim-ocr: {condition: service_healthy, required: false}
@@ -65,6 +166,12 @@ services:
       nim-caption: {condition: service_healthy, required: false}
       nim-answer: {condition: service_healthy, required: false}
       nim-audio: {condition: service_healthy, required: false}
+      ppocrv6-official: {condition: service_healthy, required: false}
+      ppocrv6-det: {condition: service_healthy, required: false}
+      ppocrv6-rec: {condition: service_healthy, required: false}
+      tesseract: {condition: service_healthy, required: false}
+      vintern-ocr: {condition: service_healthy, required: false}
+      vietocr-ocr: {condition: service_healthy, required: false}
       otel-collector: {condition: service_started, required: false}
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://localhost:7670/v1/health]
@@ -74,12 +181,109 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # Pipeline 7's server-owned Ministral FP8 VLM.  Keep it behind an explicit
+  # profile so the existing pipelines do not reserve another GPU process
+  # unless Pipeline 7 is intentionally enabled.
+  ministral-fp8:
+    <<: [*vintern-image, *host-access]
+    profiles: [ministral-fp8]
+    runtime: nvidia
+    user: nemo
+    shm_size: ${MINISTRAL_VLM_SHM_SIZE:-16gb}
+    restart: unless-stopped
+    entrypoint: []
+    command:
+      - python
+      - /opt/vintern_vllm/vllm_entrypoint.py
+      - serve
+      - ${MINISTRAL_VLM_MODEL_PATH:-/models/huggingface/models--mistralai--Ministral-3-3B-Instruct-2512/snapshots/b35d4dfe56c142746f54dbd64f579faab2744308}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --served-model-name
+      - ${MINISTRAL_VLM_SERVED_MODEL:-mistralai/Ministral-3-3B-Instruct-2512}
+      - --tokenizer_mode
+      - mistral
+      - --config_format
+      - mistral
+      - --load_format
+      - mistral
+      - --dtype
+      - auto
+      - --max-model-len
+      - "8192"
+      - --max-num-seqs
+      - "10"
+      - --max-num-batched-tokens
+      - "4096"
+      - --gpu-memory-utilization
+      - "0.33"
+      - --limit-mm-per-prompt
+      - '{"image":1}'
+    ports: ["${MINISTRAL_VLM_HOST_PORT:-8016}:8000"]
+    environment:
+      CUDA_VISIBLE_DEVICES: "${MINISTRAL_VLM_GPU_ID:-0}"
+      # FlashInfer stores its JIT kernels under ~/.cache.  Point HOME at the
+      # bind-mounted runtime cache so a restart does not repeat the expensive
+      # SM120 kernel compilation.
+      HOME: /cache
+      HF_HOME: /models/huggingface
+      HUGGINGFACE_HUB_CACHE: /models/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      VLLM_CACHE_ROOT: /cache/vllm
+      XDG_CACHE_HOME: /cache
+      TORCHINDUCTOR_CACHE_DIR: /cache/torchinductor
+      VLLM_LOGGING_LEVEL: ${MINISTRAL_VLM_LOGGING_LEVEL:-INFO}
+    volumes:
+      - ../../../cache/huggingface:/models/huggingface:ro
+      - ../../../cache/ministral-fp8:/cache:rw
+      - ../../../tools/vintern_vllm:/opt/vintern_vllm:ro
+    networks:
+      default:
+        aliases:
+          - ministral-fp8
+    healthcheck:
+      test: [CMD-SHELL, "curl --fail --silent http://127.0.0.1:8000/v1/models >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 180s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${MINISTRAL_VLM_GPU_ID:-0}"]
+              capabilities: [gpu]
+
   vectordb:
     <<: [*retriever-image, *host-access]
-    command: [python, -m, nemo_retriever.service.vectordb_app, --lancedb-uri, /data/vectordb, --table-name, nemo_retriever, --embed-endpoint, "${NIM_EMBED_URL:-https://integrate.api.nvidia.com/v1/embeddings}", --embed-model, "${NIM_EMBED_MODEL:-nvidia/llama-nemotron-embed-vl-1b-v2}", --port, "7671"]
+    command:
+      - uvicorn
+      - nemo_retriever.service.dev_entrypoints:create_vectordb_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "7671"
+      - --reload
+      - --reload-dir
+      - /workspace/nemo_retriever/src
     environment:
       NVIDIA_API_KEY: ${NVIDIA_API_KEY:-${NGC_API_KEY:-}}
-    volumes: [vectordb_data:/data/vectordb]
+      NEMO_RETRIEVER_VDB_URI: /data/vectordb
+      NEMO_RETRIEVER_VDB_TABLE: nemo_retriever
+      NEMO_RETRIEVER_VDB_EMBED_ENDPOINT: "${NIM_EMBED_URL-https://integrate.api.nvidia.com/v1/embeddings}"
+      NEMO_RETRIEVER_VDB_EMBED_MODEL: "${NIM_EMBED_MODEL:-nvidia/llama-nemotron-embed-vl-1b-v2}"
+      NEMO_RETRIEVER_VDB_EMBED_API_KEY: ${NVIDIA_API_KEY:-${NGC_API_KEY:-}}
+      NEMO_RETRIEVER_VDB_LOCAL_EMBED: "false"
+      NEMO_RETRIEVER_VDB_LOCAL_EMBED_BACKEND: hf
+      NEMO_RETRIEVER_VDB_GPU_MEMORY_UTILIZATION: "0.45"
+    volumes:
+      - ../../../:/workspace:rw
+      - ../../../cache/vectordb:/data/vectordb:rw
     depends_on:
       nim-embedding: {condition: service_healthy, required: false}
     healthcheck:
@@ -90,8 +294,87 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # Page-elements and table-structure are separate Compose services (matching
-  # Helm) but both run the combined nemotron-object-detection:2.0.0 image.
+  # Option 2 only: full PaddleOCR-VL API. It runs PP-DocLayoutV3 and the
+  # complete result assembly, then calls the local vLLM sidecar below.
+  paddleocr-vl-api:
+    <<: *paddleocr-vl-api-image
+    profiles: [paddleocr-vl]
+    runtime: nvidia
+    user: root
+    shm_size: ${PADDLEOCR_VL_SHM_SIZE:-64g}
+    ports: ["${PADDLEOCR_VL_HOST_PORT:-8118}:8080"]
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      PADDLE_PDX_CACHE_HOME: /root/.paddlex
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - ../../../cache/paddleocr-vl/api-paddlex:/root/.paddlex:rw
+      - ../../../cache/paddleocr-vl/api-huggingface:/root/.cache/huggingface:rw
+      - ./paddleocr-vl/pipeline_config_vllm.yaml:/home/paddleocr/pipeline_config_vllm.yaml:ro
+    command:
+      - /bin/bash
+      - -lc
+      - paddlex --serve --pipeline /home/paddleocr/pipeline_config_vllm.yaml --device gpu:0
+    depends_on:
+      paddleocr-vl-vlm-server: {condition: service_healthy}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${PADDLEOCR_VL_GPU_ID:-0}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: [CMD-SHELL, curl --fail --silent http://localhost:8080/health >/dev/null]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 180s
+    restart: unless-stopped
+
+  # Option 2 only: PaddleOCR-VL-1.6 VLM served by vLLM. Retriever never calls
+  # this service directly; only paddleocr-vl-api does.
+  paddleocr-vl-vlm-server:
+    <<: *paddleocr-vl-vlm-image
+    profiles: [paddleocr-vl]
+    runtime: nvidia
+    user: root
+    shm_size: ${PADDLEOCR_VL_SHM_SIZE:-64g}
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - ../../../cache/paddleocr-vl/vllm-huggingface:/root/.cache/huggingface:rw
+      - ./paddleocr-vl/vllm_config.yaml:/home/paddleocr/vllm_config.yaml:ro
+    command:
+      - /bin/bash
+      - -lc
+      - >-
+        paddleocr genai_server --model_name PaddleOCR-VL-1.6-0.9B
+        --host 0.0.0.0 --port 8080 --backend vllm
+        --backend_config /home/paddleocr/vllm_config.yaml
+    expose: ["8080"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${PADDLEOCR_VL_GPU_ID:-0}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: [CMD-SHELL, curl --fail --silent http://localhost:8080/health >/dev/null]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 300s
+    restart: unless-stopped
+
+  # Pipeline 7 uses Page Elements for semantic/evidence regions, Table
+  # Structure for table geometry, and Ministral for OCR-only crops.
   nim-page-elements:
     <<: *nim-service
     profiles: [nims-core]
@@ -102,21 +385,21 @@ services:
       NIM_OTEL_SERVICE_NAME: nemotron-page-elements-v3
       NIM_SERVER_BIND_ADDR: 0.0.0.0:8000
       NIM_PERFORMANCE_MODE: "0"
-      NIM_SERVER_MODE: latency
-      NIM_SERVER_MAX_WAIT_MS: "0"
+      NIM_SERVER_MAX_WAIT_MS: ${NIM_PAGE_ELEMENTS_SERVER_MAX_WAIT_MS:-10}
       NIM_ENGINE_COUNT: "1"
-      NIM_PIPELINE_MAX_BATCH_SIZE: "1"
+      NIM_PIPELINE_MAX_BATCH_SIZE: ${NIM_PAGE_ELEMENTS_MAX_BATCH_SIZE:-8}
+      NIM_SERVER_MODE: ${NIM_PAGE_ELEMENTS_SERVER_MODE:-throughput}
       NIM_ENGINE_MODEL_DOWNLOAD_PROVIDER: ngc
       NIM_ENGINE_MODEL_NAME: nvidia/nemotron-page-elements-v3
       NIM_ENGINE_MODEL_PATH: ${NIM_PAGE_ELEMENTS_CACHE_PATH:-/model-store}/page-elements
-    volumes: ["nim_page_elements_cache:${NIM_PAGE_ELEMENTS_CACHE_PATH:-/model-store}"]
+    volumes: ["../../../cache/nim/page-elements:${NIM_PAGE_ELEMENTS_CACHE_PATH:-/model-store}:rw"]
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://localhost:8000/v1/health/ready]
     deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${NIM_PAGE_ELEMENTS_GPU_ID:-0}"]}]}}}
 
   nim-table-structure:
     <<: *nim-service
-    profiles: [nims-core]
+    profiles: [table-structure]
     image: ${NIM_TABLE_STRUCTURE_IMAGE:-nvcr.io/nim/nvidia/nemotron-object-detection}:${NIM_TABLE_STRUCTURE_TAG:-2.0.0}
     ports: ["${NIM_TABLE_STRUCTURE_HOST_PORT:-8002}:8000"]
     environment:
@@ -124,18 +407,20 @@ services:
       NIM_OTEL_SERVICE_NAME: nemotron-table-structure-v1
       NIM_SERVER_BIND_ADDR: 0.0.0.0:8000
       NIM_PERFORMANCE_MODE: "0"
-      NIM_SERVER_MODE: latency
-      NIM_SERVER_MAX_WAIT_MS: "0"
+      NIM_SERVER_MAX_WAIT_MS: ${NIM_TABLE_STRUCTURE_SERVER_MAX_WAIT_MS:-10}
       NIM_ENGINE_COUNT: "1"
-      NIM_PIPELINE_MAX_BATCH_SIZE: "1"
+      NIM_PIPELINE_MAX_BATCH_SIZE: ${NIM_TABLE_STRUCTURE_MAX_BATCH_SIZE:-8}
+      NIM_SERVER_MODE: ${NIM_TABLE_STRUCTURE_SERVER_MODE:-throughput}
       NIM_ENGINE_MODEL_DOWNLOAD_PROVIDER: ngc
       NIM_ENGINE_MODEL_NAME: nvidia/nemotron-table-structure-v1
       NIM_ENGINE_MODEL_PATH: ${NIM_TABLE_STRUCTURE_CACHE_PATH:-/model-store}/table-structure
-    volumes: ["nim_table_structure_cache:${NIM_TABLE_STRUCTURE_CACHE_PATH:-/model-store}"]
+    volumes: ["../../../cache/nim/table-structure:${NIM_TABLE_STRUCTURE_CACHE_PATH:-/model-store}:rw"]
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://localhost:8000/v1/health/ready]
     deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${NIM_TABLE_STRUCTURE_GPU_ID:-1}"]}]}}}
 
+  # Primary integrated text detector + recognizer. This restores the original
+  # document OCR pipeline, including full-page/tiled scan recall in retriever.
   nim-ocr:
     <<: *nim-service
     profiles: [nims-core]
@@ -149,15 +434,220 @@ services:
       NIM_SERVER_MODE: latency
       NIM_SERVER_MAX_WAIT_MS: "0"
       NIM_ENGINE_COUNT: "1"
-      NIM_PIPELINE_MAX_BATCH_SIZE: "1"
+      NIM_PIPELINE_MAX_BATCH_SIZE: "${NIM_OCR_MAX_BATCH_SIZE:-1}"
       NIM_ENGINE_MODEL_DOWNLOAD_PROVIDER: ngc
       NIM_ENGINE_MODEL_NAME: nvidia/nemotron-ocr-v2
       NIM_ENGINE_MODEL_PATH: ${NIM_OCR_CACHE_PATH:-/model-store}/ocr
       NIM_ENGINE_MODEL_VARIANT: multilingual
-    volumes: ["nim_ocr_cache:${NIM_OCR_CACHE_PATH:-/model-store}"]
+    volumes: ["../../../cache/nim/ocr:${NIM_OCR_CACHE_PATH:-/model-store}:rw"]
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://localhost:8000/v1/health/ready]
-    deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${NIM_OCR_GPU_ID:-2}"]}]}}}
+    deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${NIM_OCR_GPU_ID:-0}"]}]}}}
+
+  ppocrv6-det:
+    <<: *ppocr-image
+    profiles: [ppocrv6]
+    runtime: nvidia
+    shm_size: ${PPOCR_SHM_SIZE:-8gb}
+    restart: unless-stopped
+    command: ["uvicorn", "--app-dir", "/opt/ppocrv6_service", "ppocrv6_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["${PPOCRV6_DET_HOST_PORT:-8010}:8000"]
+    environment:
+      PPOCR_ROLE: detector
+      PPOCR_DEVICE: ${PPOCR_DET_DEVICE:-gpu:0}
+      PPOCR_DET_MODEL: ${PPOCRV6_DET_MODEL:-PP-OCRv6_medium_det}
+      PPOCR_DET_BATCH_SIZE: ${PPOCRV6_DET_BATCH_SIZE:-16}
+      PPOCR_REC_MODEL: ${PPOCRV6_REC_MODEL:-PP-OCRv6_medium_rec}
+      PADDLE_HOME: /model-store/paddle
+      PADDLEX_HOME: /model-store/paddlex
+      PADDLE_PDX_CACHE_HOME: /model-store/paddlex
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+    volumes:
+      - "../../../cache/ppocrv6/det:/model-store:rw"
+      - "../../../tools/ppocrv6_service:/opt/ppocrv6_service:ro"
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8000/v1/health/ready]
+    deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${PPOCRV6_DET_GPU_ID:-0}"]}]}}}
+
+  # Option 2: one official PaddleOCR general OCR pipeline. The container owns
+  # the complete published order: doc orientation -> unwarping -> text-line
+  # orientation -> PP-OCRv6 medium detection -> PP-OCRv6 medium recognition.
+  ppocrv6-official:
+    <<: *ppocr-image
+    profiles: [ppocrv6]
+    runtime: nvidia
+    user: root
+    shm_size: ${PPOCR_OFFICIAL_SHM_SIZE:-8gb}
+    restart: unless-stopped
+    command: ["uvicorn", "--app-dir", "/opt/ppocrv6_service", "official_pipeline_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["${PPOCRV6_OFFICIAL_HOST_PORT:-8012}:8000"]
+    environment:
+      PPOCR_OFFICIAL_DEVICE: ${PPOCR_OFFICIAL_DEVICE:-gpu:0}
+      PPOCR_OFFICIAL_LANG: ${PPOCR_OFFICIAL_LANG:-vi}
+      PPOCR_DOC_ORI_MODEL: ${PPOCR_DOC_ORI_MODEL:-PP-LCNet_x1_0_doc_ori}
+      PPOCR_DOC_UNWARP_MODEL: ${PPOCR_DOC_UNWARP_MODEL:-UVDoc}
+      PPOCR_TEXTLINE_ORI_MODEL: ${PPOCR_TEXTLINE_ORI_MODEL:-PP-LCNet_x1_0_textline_ori}
+      PPOCR_DET_MODEL: ${PPOCRV6_DET_MODEL:-PP-OCRv6_medium_det}
+      PPOCR_REC_MODEL: ${PPOCRV6_REC_MODEL:-PP-OCRv6_medium_rec}
+      PADDLE_HOME: /model-store/paddle
+      PADDLEX_HOME: /model-store/paddlex
+      PADDLE_PDX_CACHE_HOME: /model-store/paddlex
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+    volumes:
+      - "../../../cache/ppocrv6/official:/model-store:rw"
+      - "../../../tools/ppocrv6_service:/opt/ppocrv6_service:ro"
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8000/v1/health/ready]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 180s
+    deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${PPOCRV6_OFFICIAL_GPU_ID:-0}"]}]}}}
+
+  ppocrv6-rec:
+    <<: *ppocr-image
+    profiles: [ppocrv6]
+    runtime: nvidia
+    shm_size: ${PPOCR_SHM_SIZE:-8gb}
+    restart: unless-stopped
+    command: ["uvicorn", "--app-dir", "/opt/ppocrv6_service", "ppocrv6_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["${PPOCRV6_REC_HOST_PORT:-8009}:8000"]
+    environment:
+      PPOCR_ROLE: recognizer
+      PPOCR_DEVICE: ${PPOCR_REC_DEVICE:-gpu:0}
+      PPOCR_DET_MODEL: ${PPOCRV6_DET_MODEL:-PP-OCRv6_medium_det}
+      PPOCR_REC_MODEL: ${PPOCRV6_REC_MODEL:-PP-OCRv6_medium_rec}
+      PADDLE_HOME: /model-store/paddle
+      PADDLEX_HOME: /model-store/paddlex
+      PADDLE_PDX_CACHE_HOME: /model-store/paddlex
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+    volumes:
+      - "../../../cache/ppocrv6/rec:/model-store:rw"
+      - "../../../tools/ppocrv6_service:/opt/ppocrv6_service:ro"
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8000/v1/health/ready]
+    deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${PPOCRV6_REC_GPU_ID:-0}"]}]}}}
+
+  # CPU-only Tesseract 5 recognizer. This service is only for the optional
+  # fusion pipeline; Option 3 uses the separate VietOCR service below.
+  tesseract:
+    <<: *tesseract-image
+    profiles: [tesseract]
+    restart: unless-stopped
+    command: ["uvicorn", "--app-dir", "/opt/tesseract_service", "tesseract_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["${TESSERACT_HOST_PORT:-8011}:8000"]
+    environment:
+      # Option 4 is Vietnamese-first.  It sends this value per request as
+      # `language=vie`; this remains the sidecar default for legacy callers.
+      TESSERACT_LANG: ${TESSERACT_LANG:-vie}
+      # Keep block-mode defaults for callers that send Page Elements boxes.
+      # Option 4 overrides this per request with lang=vie and PSM 7 after
+      # PP-OCRv6 has split each semantic block into a single text line.
+      TESSERACT_PSM: ${TESSERACT_PSM:-6}
+    volumes:
+      - "../../../cache/tesseract:/var/cache/tesseract:rw"
+      - "../../../tools/tesseract_service:/opt/tesseract_service:ro"
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8000/v1/health/ready]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Option 3 Vietnamese branch. VietOCR loads one configured predictor on GPU
+  # at startup and accepts ordered image batches; it is never used by
+  # Option 1, Option 2, or Option 4.
+  vietocr-ocr:
+    <<: *vietocr-image
+    profiles: [vietocr]
+    # The host cache directory may be created as root on first startup; run
+    # this isolated model sidecar as root so it can populate its cache.
+    user: "0:0"
+    runtime: nvidia
+    shm_size: ${VIETOCR_SHM_SIZE:-16gb}
+    restart: unless-stopped
+    command: ["uvicorn", "--app-dir", "/opt/vietocr_service", "vietocr_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["${VIETOCR_HOST_PORT:-8014}:8000"]
+    environment:
+      HOME: /workspace
+      VIETOCR_MODEL: ${VIETOCR_MODEL:-vgg_seq2seq}
+      VIETOCR_DEVICE: ${VIETOCR_DEVICE:-cuda:0}
+      VIETOCR_ALLOW_CPU: ${VIETOCR_ALLOW_CPU:-false}
+      VIETOCR_MAX_CONCURRENCY: ${VIETOCR_MAX_CONCURRENCY:-2}
+      VIETOCR_MIN_FREE_VRAM_FRACTION: ${VIETOCR_MIN_FREE_VRAM_FRACTION:-0.30}
+      VIETOCR_QUEUE_TIMEOUT_S: ${VIETOCR_QUEUE_TIMEOUT_S:-120}
+      # Option 5's native /v1/ocr/batch path uses conservative width buckets
+      # by default.  These remain opt-in deployment knobs because FP16 and
+      # wider padding must be validated against the installed GPU/model.
+      VIETOCR_WIDTH_BUCKET_PX: ${VIETOCR_WIDTH_BUCKET_PX:-128}
+      VIETOCR_MAX_WIDTH_PADDING_RATIO: ${VIETOCR_MAX_WIDTH_PADDING_RATIO:-1.35}
+      VIETOCR_USE_FP16: ${VIETOCR_USE_FP16:-false}
+      TOKENIZERS_PARALLELISM: "false"
+    volumes:
+      - "../../../cache/vietocr:/workspace/.cache:rw"
+      - "../../../tools/vietocr_service:/opt/vietocr_service:ro"
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8000/v1/health/ready]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 180s
+    deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${VIETOCR_GPU_ID:-0}"]}]}}}
+
+  # Vietnamese final recognizer for Option 2. vLLM owns the model process;
+  # the weights and compile/runtime cache stay outside the image.
+  vintern-ocr:
+    <<: *vintern-image
+    profiles: [vintern]
+    runtime: nvidia
+    user: nemo
+    shm_size: ${VINTERN_SHM_SIZE:-16gb}
+    restart: unless-stopped
+    entrypoint: []
+    command:
+      - python
+      - /opt/vintern_vllm/vllm_entrypoint.py
+      - serve
+      - /model-store/vintern
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --served-model-name
+      - Vintern-1B-v3.5
+      - --trust-remote-code
+      - --dtype
+      - bfloat16
+      - --max-model-len
+      - "4096"
+      - --max-num-seqs
+      - "${VINTERN_VLLM_MAX_NUM_SEQS:-2}"
+      - --gpu-memory-utilization
+      - "${VINTERN_VLLM_GPU_MEMORY_UTILIZATION:-0.30}"
+      - --enforce-eager
+      - --limit-mm-per-prompt
+      - '{"image":1}'
+    ports: ["${VINTERN_HOST_PORT:-8013}:8000"]
+    environment:
+      CUDA_VISIBLE_DEVICES: "${VINTERN_CUDA_VISIBLE_DEVICES:-0}"
+      HOME: /workspace
+      HF_HOME: /cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      VLLM_CACHE_ROOT: /cache/vllm
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      VLLM_LOGGING_LEVEL: ${VINTERN_VLLM_LOGGING_LEVEL:-INFO}
+    volumes:
+      - "../../../cache/vintern/model:/model-store/vintern:ro"
+      - "../../../cache/vintern/runtime:/cache:rw"
+      - "../../../tools/vintern_vllm:/opt/vintern_vllm:ro"
+    healthcheck:
+      test: [CMD-SHELL, "python -c \"import socket; s=socket.create_connection(('127.0.0.1', 8000), 2); s.close()\""]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 180s
+    deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${VINTERN_GPU_ID:-0}"]}]}}}
 
   nim-embedding:
     <<: *nim-service
@@ -170,7 +660,7 @@ services:
       NIM_OTEL_SERVICE_NAME: llama-nemotron-embed-vl-1b-v2
       NIM_TRITON_LOG_VERBOSE: "1"
       OMP_NUM_THREADS: "1"
-    volumes: ["nim_embedding_cache:${NIM_EMBED_CACHE_PATH:-/opt/nim/.cache}"]
+    volumes: ["../../../cache/nim/embedding:${NIM_EMBED_CACHE_PATH:-/opt/nim/.cache}:rw"]
     deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${NIM_EMBED_GPU_ID:-3}"]}]}}}
 
   nim-reranker:
@@ -179,7 +669,7 @@ services:
     image: ${NIM_RERANK_IMAGE:-nvcr.io/nim/nvidia/llama-nemotron-rerank-vl-1b-v2}:${NIM_RERANK_TAG:-1.11.0}
     ports: ["${NIM_RERANK_HOST_PORT:-8005}:8000"]
     environment: {<<: *nim-environment, NIM_HTTP_API_PORT: "8000", NIM_OTEL_SERVICE_NAME: llama-nemotron-rerank-vl-1b-v2, NIM_TRITON_LOG_VERBOSE: "1"}
-    volumes: ["nim_reranker_cache:${NIM_RERANK_CACHE_PATH:-/opt/nim/.cache}"]
+    volumes: ["../../../cache/nim/reranker:${NIM_RERANK_CACHE_PATH:-/opt/nim/.cache}:rw"]
     deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${NIM_RERANK_GPU_ID:-4}"]}]}}}
 
   nim-nemotron-parse:
@@ -188,7 +678,7 @@ services:
     image: ${NIM_PARSE_IMAGE:-nvcr.io/nim/nvidia/nemotron-parse-v1.2}:${NIM_PARSE_TAG:-1.7.0-variant}
     ports: ["${NIM_PARSE_HOST_PORT:-8006}:8000"]
     environment: {<<: *nim-environment, NIM_HTTP_API_PORT: "8000", NIM_OTEL_SERVICE_NAME: nemotron-parse-v1.2, NIM_TRITON_LOG_VERBOSE: "1"}
-    volumes: ["nim_parse_cache:${NIM_PARSE_CACHE_PATH:-/opt/nim/.cache}"]
+    volumes: ["../../../cache/nim/parse:${NIM_PARSE_CACHE_PATH:-/opt/nim/.cache}:rw"]
     deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${NIM_PARSE_GPU_ID:-5}"]}]}}}
 
   nim-caption:
@@ -197,7 +687,7 @@ services:
     image: ${NIM_CAPTION_IMAGE:-nvcr.io/nim/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning}:${NIM_CAPTION_TAG:-1.7.0-variant}
     ports: ["${NIM_CAPTION_HOST_PORT:-8007}:8000"]
     environment: {<<: *nim-environment, NIM_HTTP_API_PORT: "8000", NIM_OTEL_SERVICE_NAME: nemotron-3-nano-omni-30b-a3b-reasoning, NIM_TRITON_LOG_VERBOSE: "1"}
-    volumes: ["nim_caption_cache:${NIM_CAPTION_CACHE_PATH:-/opt/nim/.cache}"]
+    volumes: ["../../../cache/nim/caption:${NIM_CAPTION_CACHE_PATH:-/opt/nim/.cache}:rw"]
     deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${NIM_CAPTION_GPU_ID:-6}"]}]}}}
 
   nim-answer:
@@ -213,7 +703,7 @@ services:
       NIM_PASSTHROUGH_ARGS: ${NIM_ANSWER_PASSTHROUGH_ARGS:---disable-custom-all-reduce}
       NCCL_IB_DISABLE: "1"
       NCCL_P2P_DISABLE: "1"
-    volumes: ["nim_answer_cache:${NIM_ANSWER_CACHE_PATH:-/opt/nim/.cache}"]
+    volumes: ["../../../cache/nim/answer:${NIM_ANSWER_CACHE_PATH:-/opt/nim/.cache}:rw"]
     deploy:
       resources:
         reservations:
@@ -233,7 +723,7 @@ services:
       NIM_OTEL_SERVICE_NAME: parakeet-1-1b-ctc-en-us
       NIM_TAGS_SELECTOR: ${NIM_AUDIO_TAGS_SELECTOR:-name=parakeet-1-1b-ctc-en-us,mode=ofl,vad=default,diarizer=disabled}
       NIM_TRITON_LOG_VERBOSE: "1"
-    volumes: ["nim_audio_cache:${NIM_AUDIO_CACHE_PATH:-/opt/nim/.cache}"]
+    volumes: ["../../../cache/nim/audio:${NIM_AUDIO_CACHE_PATH:-/opt/nim/.cache}:rw"]
     deploy: {resources: {reservations: {devices: [{<<: *nim-gpu, device_ids: ["${NIM_AUDIO_GPU_ID:-9}"]}]}}}
 
   otel-collector:
@@ -272,9 +762,24 @@ configs:
         file: "/var/lib/nemo-retriever/retriever-service.log"
         format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
       nim_endpoints:
-        page_elements_invoke_url: "${NIM_PAGE_ELEMENTS_URL-http://nim-page-elements:8000/v1/page-elements}"
-        table_structure_invoke_url: "${NIM_TABLE_STRUCTURE_URL-http://nim-table-structure:8000/v1/table-structure}"
-        ocr_invoke_url: "${NIM_OCR_URL-http://nim-ocr:8000/v1/ocr}"
+        official_ppocr_invoke_url: "${PPOCRV6_OFFICIAL_URL-}"
+        paddleocr_vl_invoke_url: "${PADDLEOCR_VL_URL-}"
+        page_elements_invoke_url: "${NIM_PAGE_ELEMENTS_URL-https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-page-elements-v3}"
+        # Pipeline 7 uses Table Structure for table cell/row/column geometry.
+        table_structure_invoke_url: "${NIM_TABLE_STRUCTURE_URL-}"
+        ocr_invoke_url: "${NIM_OCR_URL-https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-ocr-v2}"
+        vintern_ocr_invoke_url: "${VINTERN_URL-}"
+        # Pipeline 7 is routed to the Compose-managed FP8 sidecar by default.
+        # Override this only when the operator intentionally runs Ministral
+        # outside the development network.
+        ministral_vlm_invoke_url: "${MINISTRAL_VLM_URL:-http://ministral-fp8:8000/v1/chat/completions}"
+        # Option 3 only. The in-stack VietOCR sidecar is the default; an
+        # operator-owned remote recognizer can override it with
+        # VIETNAMESE_OCR_URL without affecting any other OCR selector.
+        vietnamese_ocr_invoke_url: "${VIETNAMESE_OCR_URL:-http://vietocr-ocr:8000/v1/ocr}"
+        line_detector_invoke_url: "${PPOCRV6_OPTION2_DET_URL-${PPOCRV6_DET_URL-}}"
+        ocr_recognizer_invoke_url: "${PPOCRV6_REC_URL-}"
+        tesseract_ocr_invoke_url: "${TESSERACT_OCR_URL-}"
         embed_invoke_url: "${NIM_EMBED_URL-https://integrate.api.nvidia.com/v1/embeddings}"
         embed_model_name: "${NIM_EMBED_MODEL:-nvidia/llama-nemotron-embed-vl-1b-v2}"
         caption_invoke_url: ${NIM_CAPTION_URL:-null}
@@ -291,8 +796,7 @@ configs:
         extract:
           enabled: ${LOCAL_EXTRACT_ENABLED:-true}
           use_table_structure: ${LOCAL_EXTRACT_USE_TABLE_STRUCTURE:-true}
-          use_graphic_elements: ${LOCAL_EXTRACT_USE_GRAPHIC_ELEMENTS:-true}
-          ocr_version: "${LOCAL_EXTRACT_OCR_VERSION:-v2}"
+          ocr_version: ${LOCAL_EXTRACT_OCR_VERSION:-v2}
           ocr_lang: ${LOCAL_EXTRACT_OCR_LANG_YAML:-null}
         embed:
           enabled: ${LOCAL_EMBED_ENABLED:-true}
@@ -349,16 +853,3 @@ configs:
           traces: {receivers: [otlp], processors: [batch], exporters: [zipkin, debug]}
           metrics: {receivers: [otlp], processors: [batch], exporters: [prometheus, debug]}
           logs: {receivers: [otlp], processors: [batch], exporters: [debug]}
-
-volumes:
-  retriever_data:
-  vectordb_data:
-  nim_page_elements_cache: {name: "${NIM_PAGE_ELEMENTS_CACHE_VOLUME:-nemo-retriever-nim-page-elements-cache}"}
-  nim_table_structure_cache: {name: "${NIM_TABLE_STRUCTURE_CACHE_VOLUME:-nemo-retriever-nim-table-structure-cache}"}
-  nim_ocr_cache: {name: "${NIM_OCR_CACHE_VOLUME:-nemo-retriever-nim-ocr-cache}"}
-  nim_embedding_cache: {name: "${NIM_EMBED_CACHE_VOLUME:-nemo-retriever-nim-embedding-cache}"}
-  nim_reranker_cache: {name: "${NIM_RERANK_CACHE_VOLUME:-nemo-retriever-nim-reranker-cache}"}
-  nim_parse_cache: {name: "${NIM_PARSE_CACHE_VOLUME:-nemo-retriever-nim-parse-cache}"}
-  nim_caption_cache: {name: "${NIM_CAPTION_CACHE_VOLUME:-nemo-retriever-nim-caption-cache}"}
-  nim_answer_cache: {name: "${NIM_ANSWER_CACHE_VOLUME:-nemo-retriever-nim-answer-cache}"}
-  nim_audio_cache: {name: "${NIM_AUDIO_CACHE_VOLUME:-nemo-retriever-nim-audio-cache}"}

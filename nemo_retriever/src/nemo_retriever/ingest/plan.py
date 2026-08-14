@@ -15,7 +15,7 @@ from nemo_retriever.ingestor.manifest import (
     build_input_manifest,
     plan_extraction_branches,
 )
-from nemo_retriever.common.modality.ocr.config import OCRLang, OCRVersion
+from nemo_retriever.common.modality.ocr.config import OCRLang
 from nemo_retriever.common.params import (
     ASRParams,
     AudioChunkParams,
@@ -42,13 +42,13 @@ from nemo_retriever.common.input_files import (
 from nemo_retriever.models import resolve_embed_model
 
 IngestRunModeValue = Literal["inprocess", "batch"]
-IngestInputTypeValue = Literal["auto", "pdf", "doc", "txt", "html", "image", "audio", "video"]
+IngestInputTypeValue = Literal["auto", "pdf", "doc", "txt", "html", "spreadsheet", "image", "audio", "video"]
 IngestProfileValue = Literal["auto", "fast-text"]
 IngestIndexModeValue = Literal["dense", "hybrid", "sparse"]
 AudioSplitTypeValue = Literal["size", "time", "frame"]
 LocalIngestEmbedBackendValue = Literal["vllm", "hf"]
+OcrVersionValue = Literal["v1", "v2"]
 OcrLangValue = OCRLang
-OcrVersionValue = OCRVersion
 TableOutputFormatValue = Literal["pseudo_markdown", "markdown"]
 _SUPPORTED_RUN_MODES: tuple[IngestRunModeValue, ...] = ("inprocess", "batch")
 _SUPPORTED_PROFILES: tuple[IngestProfileValue, ...] = ("auto", "fast-text")
@@ -60,6 +60,7 @@ _SUPPORTED_INPUT_TYPES: tuple[IngestInputTypeValue, ...] = (
     "doc",
     "txt",
     "html",
+    "spreadsheet",
     "image",
     "audio",
     "video",
@@ -117,14 +118,21 @@ class IngestExtractOptions:
     extract_tables: bool | None = None
     extract_charts: bool | None = None
     extract_infographics: bool | None = None
+    extract_stamps: bool | None = None
     extract_page_as_image: bool | None = None
     use_page_elements: bool | None = None
     use_table_structure: bool | None = None
     page_elements_invoke_url: str | None = None
     ocr_invoke_url: str | None = None
+    line_detector_invoke_url: str | None = None
+    ocr_recognizer_invoke_url: str | None = None
+    vietnamese_ocr_invoke_url: str | None = None
+    ministral_vlm_invoke_url: str | None = None
     ocr_version: OcrVersionValue | None = None
     ocr_lang: OcrLangValue | None = None
     table_structure_invoke_url: str | None = None
+    stamp_detection_invoke_url: str | None = None
+    stamp_detection_min_score: float | None = None
     table_output_format: TableOutputFormatValue | None = None
     extract_api_key: str | None = None
     batch: IngestExtractBatchOptions = field(default_factory=IngestExtractBatchOptions)
@@ -566,6 +574,8 @@ def _split_config_for_families(
         split_config["pdf"] = dict(chunk_dict)
     # Txt/html chunking is already passed through text_params/html_params.
     # Keep split_config for families that do not have dedicated params here.
+    if "spreadsheet" in families:
+        split_config["spreadsheet"] = dict(chunk_dict)
     if "image" in families:
         split_config["image"] = dict(chunk_dict)
     if "audio" in families:
@@ -619,6 +629,10 @@ def resolve_ingest_plan(request: IngestPlanRequest) -> ResolvedIngestPlan:
                 "use_table_structure": extract.use_table_structure,
                 "page_elements_invoke_url": extract.page_elements_invoke_url,
                 "ocr_invoke_url": extract.ocr_invoke_url,
+                "line_detector_invoke_url": extract.line_detector_invoke_url,
+                "ocr_recognizer_invoke_url": extract.ocr_recognizer_invoke_url,
+                "vietnamese_ocr_invoke_url": extract.vietnamese_ocr_invoke_url,
+                "ministral_vlm_invoke_url": extract.ministral_vlm_invoke_url,
                 "ocr_version": extract.ocr_version,
                 "ocr_lang": extract.ocr_lang,
                 "table_structure_invoke_url": extract.table_structure_invoke_url,

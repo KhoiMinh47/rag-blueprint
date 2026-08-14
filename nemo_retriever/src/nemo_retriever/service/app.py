@@ -278,7 +278,10 @@ def create_app(config: ServiceConfig) -> FastAPI:
     app.include_router(work.router, prefix="/v1")
     instrument_app(app, role=config.mode)
 
-    if config.mode == "gateway":
+    # The dashboard is useful for both the split gateway and the normal
+    # standalone ingest service. Worker-only pods do not own the job tracker
+    # or the complete operator-facing view, so keep it off those roles.
+    if config.mode in ("gateway", "standalone"):
         from pathlib import Path as _Path
 
         from fastapi.staticfiles import StaticFiles

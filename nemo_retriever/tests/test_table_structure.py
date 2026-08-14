@@ -437,8 +437,8 @@ class TestOCRJoinsTableStructure:
         # Structure-aware markdown includes a header separator; pseudo-markdown does not.
         assert "---" in text, f"expected structure-aware markdown, got: {text!r}"
 
-    def test_local_path_falls_back_when_no_structure_match(self) -> None:
-        """No matching structure region -> OCR pseudo-markdown fallback; no raise."""
+    def test_local_path_does_not_fabricate_table_when_structure_is_missing(self) -> None:
+        """Missing structure must remain visible as an explicit incomplete table."""
         from nemo_retriever.common.modality.ocr.shared import ocr_page_elements
 
         # TS regions is empty so there's no match for the table crop bbox.
@@ -456,13 +456,8 @@ class TestOCRJoinsTableStructure:
 
         entries = result.iloc[0]["table"]
         assert len(entries) == 1
-        # Pseudo-markdown fallback still produces text with the OCR cell content,
-        # but does not include the structure-aware markdown header separator.
-        text = entries[0]["text"]
-        assert text  # non-empty
-        for cell in ("A", "B", "C", "D"):
-            assert cell in text
-        assert "---" not in text, f"expected pseudo-markdown fallback, got: {text!r}"
+        assert entries[0]["text"] == ""
+        assert entries[0]["table_structure_status"] == "unmatched_region"
 
     def test_remote_path_joins_structure_and_ocr(self) -> None:
         """Remote OCR path should join structure + OCR the same way as the local path."""

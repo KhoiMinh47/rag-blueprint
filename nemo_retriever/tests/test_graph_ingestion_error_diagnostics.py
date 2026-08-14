@@ -22,6 +22,8 @@ that build :class:`GraphIngestionError` directly.
 
 from __future__ import annotations
 
+import pickle
+
 import pandas as pd
 import pytest
 
@@ -307,6 +309,36 @@ def test_error_message_remains_backwards_compatible_without_diagnostics() -> Non
     assert "stage=" not in rendered
     assert "Troubleshooting:" not in rendered
     assert err.stage_diagnostics == {}
+
+
+def test_error_roundtrip_preserves_records_across_process_boundaries() -> None:
+    """ProcessPool unpickling must not reinterpret the rendered message as records."""
+    diag = _StageDiagnostic(
+        column="ocr",
+        display_name="Nemotron OCR v2 NIM",
+        invoke_url="http://ocr.svc/v1/ocr",
+        role="ocr",
+    )
+    records = [
+        {
+            "row_index": 0,
+            "column": "ocr",
+            "path": "errors[0]",
+            "error": {
+                "stage": "option4.line_detector",
+                "type": "ConnectionError",
+                "message": "ppocrv6-det is unreachable",
+            },
+        }
+    ]
+
+    restored = pickle.loads(pickle.dumps(GraphIngestionError(records, {"ocr": diag})))
+
+    assert isinstance(restored, GraphIngestionError)
+    assert restored.records == records
+    assert restored.stage_diagnostics == {"ocr": diag}
+    assert "G; row" not in str(restored)
+    assert "ppocrv6-det is unreachable" in str(restored)
 
 
 def test_error_message_truncation_marker_renders_only_when_more_than_five() -> None:

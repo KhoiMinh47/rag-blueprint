@@ -41,6 +41,7 @@ _BRANCH_SPECS: tuple[ExtractionBranchSpec, ...] = (
     ExtractionBranchSpec(family="image", input_types=("image",), extraction_mode="image"),
     ExtractionBranchSpec(family="txt", input_types=("txt",), extraction_mode="text"),
     ExtractionBranchSpec(family="html", input_types=("html",), extraction_mode="html"),
+    ExtractionBranchSpec(family="spreadsheet", input_types=("spreadsheet",), extraction_mode="spreadsheet"),
     ExtractionBranchSpec(family="audio", input_types=("audio",), extraction_mode="audio"),
     # Video keeps extraction_mode="auto" because build_graph uses the presence
     # of video params to construct the dedicated video extraction chain.
@@ -177,6 +178,10 @@ def resolve_branch_extraction_inputs(
         text_params = text_params or TextChunkParams()
     elif family == "html":
         html_params = html_params or HtmlChunkParams()
+    elif family == "spreadsheet":
+        # Spreadsheet extraction creates its own sheet/range-aware chunks,
+        # using text params only for the row-group size estimate.
+        text_params = text_params or TextChunkParams()
     elif family == "audio":
         audio_chunk_params = audio_chunk_params or AudioChunkParams(
             split_type="size",

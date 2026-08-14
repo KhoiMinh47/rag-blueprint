@@ -293,7 +293,7 @@ def reorder_boxes(
 def _normalize_ocr_items(preds: Any) -> List[Dict[str, Any]]:
     """Normalize any OCR output format to ``[{"left", "right", "upper", "lower", "text"}, ...]``.
 
-    Handles both list-of-dict (Nemotron OCR normalized-coord form) and
+    Handles both list-of-dict normalized-coordinate form and
     dict with ``boxes``/``texts`` keys (packed form).
     """
     items: List[Dict[str, Any]] = []
@@ -419,7 +419,7 @@ def join_table_structure_and_ocr_output(
         From ``_prediction_to_detections()`` with label_names cell/row/column
         and ``bbox_xyxy_norm`` in [0, 1].
     ocr_preds : list | dict
-        Raw OCR output from ``NemotronOCRV1.invoke()``.
+    Raw OCR output from the configured recognizer.
     crop_hw : (int, int)
         ``(H, W)`` of the crop image.
     """

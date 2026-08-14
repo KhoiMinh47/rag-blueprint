@@ -72,6 +72,28 @@ def test_text_build_graph_does_not_use_modal_content_reshape() -> None:
     assert "ExplodeContentToRows" not in _graph_node_names(graph)
 
 
+def test_pdf_image_only_extraction_keeps_page_elements_and_ocr_stages() -> None:
+    """Visual-only PDF extraction must not stop after PDFium rasterization."""
+    graph = build_graph(
+        extraction_mode="pdf",
+        extract_params=ExtractParams(
+            method="pdfium_hybrid",
+            extract_text=False,
+            extract_images=True,
+            extract_tables=False,
+            extract_charts=False,
+            extract_infographics=False,
+            use_page_elements=True,
+        ),
+        embed_params=EmbedParams(),
+    )
+
+    names = _graph_node_names(graph)
+    assert "PDFExtractionActor" in names
+    assert "PageElementDetectionActor" in names
+    assert "OCRActor" in names or "OCRCPUActor" in names or "OCRGPUActor" in names
+
+
 def test_batch_graph_forwards_resolvable_hosted_parse_contract() -> None:
     from nemo_retriever.operators.extract.parse.nemotron_parse import _resolve_nemotron_parse_contract
 
@@ -764,6 +786,8 @@ class TestMultiTypeExtractOperator:
             "/folder/image.png",
             "/folder/text.txt",
             "/folder/page.html",
+            "/folder/table.xlsx",
+            "/folder/export.csv",
             "/folder/audio.mp3",
             "/folder/video.mp4",
         ]
@@ -774,6 +798,7 @@ class TestMultiTypeExtractOperator:
         assert grouped["image"] == ["/folder/image.png"]
         assert grouped["text"] == ["/folder/text.txt"]
         assert grouped["html"] == ["/folder/page.html"]
+        assert grouped["spreadsheet"] == ["/folder/table.xlsx", "/folder/export.csv"]
         assert grouped["audio"] == ["/folder/audio.mp3"]
         assert grouped["video"] == ["/folder/video.mp4"]
 

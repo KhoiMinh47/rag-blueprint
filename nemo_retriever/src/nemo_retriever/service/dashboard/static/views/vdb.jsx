@@ -65,15 +65,15 @@ function VdbView() {
 
     /* Table info */
     React.createElement('div', { className: 'section' },
-      React.createElement('div', { className: 'section-title' }, 'Vector Database'),
+      React.createElement('div', { className: 'section-title' }, 'Cơ sở dữ liệu vector'),
       tableError
         ? React.createElement('div', { className: 'card' },
             React.createElement('div', { style: { color: 'var(--nv-red)' } },
-              'Failed to load VDB info: ' + tableError
+              'Tải thông tin VDB thất bại: ' + tableError
             )
           )
         : !tables
-          ? React.createElement('div', { className: 'empty-state' }, 'Loading…')
+          ? React.createElement('div', { className: 'empty-state' }, 'Đang tải…')
           : tables.error
             ? React.createElement('div', { className: 'card' },
                 React.createElement('div', { style: { color: 'var(--nv-yellow)' } }, tables.error)
@@ -81,16 +81,16 @@ function VdbView() {
             : React.createElement('div', { className: 'card-grid' },
                 (tables.tables || []).map((t, i) =>
                   React.createElement('div', { key: i, className: 'card' },
-                    React.createElement('div', { className: 'card-title' }, 'Table'),
+                    React.createElement('div', { className: 'card-title' }, 'Bảng'),
                     React.createElement('div', { style: { marginBottom: 8 } },
                       React.createElement('span', { className: 'mono', style: { fontSize: 16, fontWeight: 600 } }, t.name || '—'),
                     ),
                     React.createElement('div', { className: 'pod-card-detail' },
                       React.createElement('span', { className: `status-dot ${t.exists ? 'ok' : 'error'}` }),
-                      t.exists ? 'Exists' : 'Not found',
+                      t.exists ? 'Đang tồn tại' : 'Không tìm thấy',
                     ),
                     React.createElement('div', { className: 'pod-card-detail' },
-                      `Rows: ${(t.total_rows || 0).toLocaleString()}`,
+                      `Số row: ${(t.total_rows || 0).toLocaleString()}`,
                     ),
                   )
                 )
@@ -99,12 +99,12 @@ function VdbView() {
 
     /* Query interface */
     React.createElement('div', { className: 'section' },
-      React.createElement('div', { className: 'section-title' }, 'Query'),
+      React.createElement('div', { className: 'section-title' }, 'Truy vấn'),
       React.createElement('div', { className: 'query-bar' },
         React.createElement('input', {
           className: 'input',
           type: 'text',
-          placeholder: 'Enter search query…',
+          placeholder: 'Nhập nội dung cần tìm…',
           value: query,
           onChange: e => setQuery(e.target.value),
           onKeyDown: onKeyDown,
@@ -122,24 +122,24 @@ function VdbView() {
           className: 'btn btn-primary',
           onClick: doSearch,
           disabled: searching || !query.trim(),
-        }, searching ? 'Searching…' : 'Search'),
+        }, searching ? 'Đang tìm…' : 'Tìm kiếm'),
       ),
       queryError && React.createElement('div', {
         style: { color: 'var(--nv-red)', fontSize: 13, marginBottom: 12 },
-      }, 'Error: ' + queryError),
+      }, 'Lỗi: ' + queryError),
     ),
 
     /* Results table */
     React.createElement('div', { className: 'section' },
       React.createElement('div', { className: 'section-title' },
-        results ? `Results (${hits.length} hits)` : 'Results'
+        results ? `Kết quả (${hits.length} mục)` : 'Kết quả'
       ),
       !results && !searching
-        ? React.createElement('div', { className: 'empty-state' }, 'Run a query to see results')
+        ? React.createElement('div', { className: 'empty-state' }, 'Thực hiện truy vấn để xem kết quả')
         : searching
-          ? React.createElement('div', { className: 'empty-state' }, 'Searching…')
+          ? React.createElement('div', { className: 'empty-state' }, 'Đang tìm…')
           : hits.length === 0
-            ? React.createElement('div', { className: 'empty-state' }, 'No results found')
+            ? React.createElement('div', { className: 'empty-state' }, 'Không tìm thấy kết quả')
             : React.createElement('div', { className: 'table-wrap' },
                 React.createElement('table', null,
                   React.createElement('thead', null,

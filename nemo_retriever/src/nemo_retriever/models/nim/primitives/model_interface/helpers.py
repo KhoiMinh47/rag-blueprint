@@ -87,7 +87,7 @@ def preprocess_image_for_paddle(array: np.ndarray, image_max_dimension: int = 96
     return transposed, metadata
 
 
-def preprocess_image_for_ocr(
+def preprocess_image_for_grpc(
     array: np.ndarray,
     target_height: Optional[int] = None,
     target_width: Optional[int] = None,
@@ -96,9 +96,9 @@ def preprocess_image_for_ocr(
     channel_first: bool = False,
 ) -> np.ndarray:
     """
-    Preprocesses an input image to be suitable for use with Nemotron-OCR.
+    Preprocess an image for a channel-first gRPC vision endpoint.
 
-    This function is intended for preprocessing images to be passed as input to Nemotron-OCR using GRPC.
+    This legacy helper is retained for generic gRPC integrations.
     It is not necessary when using the HTTP endpoint.
 
     Parameters:
@@ -132,7 +132,7 @@ def preprocess_image_for_ocr(
         padded = padded / 255.0
 
     if channel_first:
-        # Nemotron-OCR NIM (GRPC) requires input to be (channel, height, width).
+        # Some gRPC vision endpoints require input to be (channel, height, width).
         padded = padded.transpose((2, 0, 1))
 
     # Metadata can used for inverting transformations on the resulting bounding boxes.

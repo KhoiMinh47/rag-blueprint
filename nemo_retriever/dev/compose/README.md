@@ -7,6 +7,17 @@ gateway/realtime/batch topology use the [Helm chart](../../helm/README.md).
 Run commands from the repository root. Docker Compose 2.23.1 or newer is
 required for optional dependencies and inline configs.
 
+The development stack mounts the checkout at `/workspace`. VectorDB runs
+through Uvicorn with `--reload`; the retriever intentionally does not, because
+its development Job Tracker and visual evidence store are process-local and a
+source edit would otherwise invalidate active uploads. Restart the retriever
+explicitly after backend changes. This repository does not contain a separate
+frontend container; these Compose files are for backend and model services.
+
+Runtime data and model caches are bind-mounted under the repository's
+`./cache/` directory: `cache/retriever`, `cache/vectordb`,
+`cache/huggingface`, and `cache/nim/<service>`.
+
 Building the service image pulls its Ubuntu base image from NVCR. If the build
 fails with `403 Forbidden` while pulling `nvcr.io/nvidia/base/ubuntu`,
 authenticate to the registry with an NGC API key:
@@ -45,13 +56,13 @@ Use the NVCR authentication described above before pulling a self-hosted NIM.
 Keep `NGC_API_KEY` exported so it is also available to the NIM containers. The
 hosted-only stack does not require `NGC_API_KEY` at runtime.
 
-Start the four core extraction/retrieval NIM services with their checked-in internal
-endpoint wiring:
+Start the four core NIM services with their
+checked-in internal endpoint wiring:
 
 ```bash
 docker compose --env-file nemo_retriever/dev/compose/presets/nims-core.env \
   --profile nims-core \
-  -f nemo_retriever/dev/compose/service-mode.compose.yaml up --build -d
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml up -d
 ```
 
 Optional wiring presets are `nim-caption.env`, `nim-answer.env`, and
@@ -84,19 +95,126 @@ Reranker and Parse need only `--profile nim-reranker` or
 `--profile nim-parse`. They are lifecycle/API-only and intentionally are not
 injected into retriever service configuration, matching Helm.
 
-Every NIM has a persistent model or cache volume, a configurable GPU assignment, and a
+Every model service has a persistent model or cache bind mount, a configurable GPU assignment, and a
 configurable host port. Variables follow the service prefix, for example
-`NIM_OCR_GPU_ID`, `NIM_OCR_HOST_PORT`, `NIM_OCR_CACHE_VOLUME`,
-`NIM_OCR_CACHE_PATH`, `NIM_OCR_IMAGE`, and `NIM_OCR_TAG`. The defaults form a
-collision-free assignment for the combined-profile example: core NIMs use GPUs
-0, 1, 2, and 3 (page-elements, table-structure, OCR, and embedding), reranker uses 4,
-parse uses 5, caption uses 6, answer uses 7-8, and audio uses 9. Change the
-defaults to match the active profiles and host before
-startup; for example, an answer-only run on a two-GPU host can set
-`NIM_ANSWER_GPU_ID_0=0` and `NIM_ANSWER_GPU_ID_1=1`. Compose lifecycle support
+`NIM_OCR_GPU_ID`, `NIM_OCR_HOST_PORT`, and `NIM_OCR_CACHE_PATH`. The
+host-side cache root is fixed at
+`./cache/nim/`; the `*_CACHE_PATH` variables only change the container target
+path. The checked-in core preset assigns page-elements, table-structure,
+Nemotron OCR v2, and embedding to GPU 0 for this single-GPU development setup.
+Override each `*_GPU_ID` before startup on another host. Compose lifecycle support
 means image pull, startup, readiness, persistent model or cache data, restart, logs, and
 teardown; NIM Operator reconciliation, NIMCache CRDs, and model-profile
 selection remain Kubernetes-only.
+
+### Pipeline 6: Qwen3.5 tuning
+
+Pipeline 6 has an isolated tuning file at
+`presets/option6-qwen-nvfp4.env`. It controls the vLLM memory/admission limits,
+client fan-out, Page Elements batch, PDF extraction workers, and scan policy.
+Layer it after the core preset so benchmark changes do not require editing
+Python or affect pipelines 1–5/7:
+
+```bash
+docker compose \
+  --env-file nemo_retriever/dev/compose/presets/nims-core.env \
+  --env-file nemo_retriever/dev/compose/presets/option6-qwen-nvfp4.env \
+  --profile nims-core --profile qwen35-nvfp4 \
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml \
+  -f nemo_retriever/dev/compose/qwen35-vllm.compose.yaml up -d
+```
+
+When the NVFP4 quality gate fails, use the checked-in FP8 comparison preset
+with the same limits and batches:
+
+```bash
+docker compose \
+  --env-file nemo_retriever/dev/compose/presets/nims-core.env \
+  --env-file nemo_retriever/dev/compose/presets/option6-qwen-fp8.env \
+  --profile nims-core --profile qwen35-nvfp4 \
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml \
+  -f nemo_retriever/dev/compose/qwen35-vllm.compose.yaml up -d
+```
+
+`OPTION6_MODEL`, `OPTION6_VLLM_MODEL_PATH`, and
+`OPTION6_VLLM_QUANTIZATION` select the model without changing Python. The
+current presets keep `OPTION6_VLLM_MAX_MODEL_LEN=32768`, vLLM admission at
+eight sequences, and the logical client ceiling at 25.
+
+If FP8 also fails the strict quality gate, the downloaded BF16 base model is
+configured in `presets/option6-qwen-bf16.env`. Recreate only the Qwen sidecar
+with that preset so the previous Qwen process is stopped before BF16 loads:
+
+```bash
+docker compose \
+  --env-file nemo_retriever/dev/compose/presets/nims-core.env \
+  --env-file nemo_retriever/dev/compose/presets/option6-qwen-bf16.env \
+  --profile nims-core --profile qwen35-nvfp4 \
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml \
+  -f nemo_retriever/dev/compose/qwen35-vllm.compose.yaml up -d --no-deps --force-recreate qwen35-nvfp4
+```
+
+`OPTION6_VLM_MAX_CONCURRENCY` is the HTTP client ceiling; effective GPU
+concurrency is still bounded by `OPTION6_VLLM_MAX_NUM_SEQS`.
+`OPTION6_CROP_IMAGE_FORMAT=JPEG` and `OPTION6_CROP_JPEG_QUALITY=95` keep
+crop encoding fast while preserving high-quality text edges; set the format
+to `PNG` for a lossless crop benchmark.
+
+### Option 3: Nemotron OCR v2 plus GPU VietOCR
+
+Option 3 keeps Nemotron OCR v2 as the baseline and routes Vietnamese candidates
+to the separate GPU VietOCR sidecar. The Compose config defaults
+`vietnamese_ocr_invoke_url` to `http://vietocr-ocr:8000/v1/ocr`; override it with
+`VIETNAMESE_OCR_URL` when using another server-owned Vietnamese recognizer.
+
+Start the sidecar and retriever with the Option 3 preset:
+
+```bash
+docker compose \
+  --env-file nemo_retriever/dev/compose/presets/option3-vietocr.env \
+  --profile vietocr \
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml up --build -d
+```
+
+If Nemotron OCR v2 is self-hosted as well, add the core preset and profile:
+
+```bash
+docker compose \
+  --env-file nemo_retriever/dev/compose/presets/nims-core.env \
+  --env-file nemo_retriever/dev/compose/presets/option3-vietocr.env \
+  --profile nims-core --profile vietocr \
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml up --build -d
+```
+
+Pipeline 5 also uses the split PP-OCRv6 detector for tall Vietnamese text
+boxes. Start `ppocrv6-det` alongside the core and VietOCR services; Pipeline 5
+calls its `/v1/detect-batch` route in one document-level logical batch and
+falls back to the CPU projection splitter if the sidecar is unavailable.
+
+```bash
+docker compose \
+  --env-file nemo_retriever/dev/compose/presets/nims-core.env \
+  --env-file nemo_retriever/dev/compose/presets/option3-vietocr.env \
+  --profile nims-core --profile vietocr --profile ppocrv6 \
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml \
+  up --build -d retriever vectordb nim-page-elements nim-table-structure nim-ocr nim-embedding vietocr-ocr ppocrv6-det
+```
+
+To enable the official PP-OCRv6 Option 2 pipeline, start the PP-OCRv6 profile
+in addition to the core services:
+
+```bash
+docker compose \
+  --env-file nemo_retriever/dev/compose/presets/nims-core.env \
+  --profile nims-core --profile ppocrv6 \
+  -f nemo_retriever/dev/compose/service-mode.compose.yaml up --build -d
+```
+
+The profile starts the official whole-page service
+`ppocrv6-official:/v1/ocr` and also keeps the split
+`ppocrv6-det:/v1/detect` + `ppocrv6-rec:/v1/recognize` services available for
+the other experimental option. Option 1 remains the default; the dashboard's
+Option 2 selector now calls only `ppocrv6-official`.
 
 Answer behavior is configurable through `ANSWER_LLM_ENABLED`,
 `ANSWER_LLM_MODEL`, `ANSWER_LLM_API_BASE_YAML`, `ANSWER_LLM_TEMPERATURE`,
@@ -125,8 +243,9 @@ Local mode is mutually exclusive with the `nims-core` profile. Optional answer,
 caption, and audio NIMs may be layered onto it by adding their wiring preset
 and matching `--profile`; their remote endpoints take precedence for those
 stages. Tune warmup, process-pool cap, embedding memory fraction, and cache
-name with the `LOCAL_MODELS_*`, `LOCAL_EMBED_GPU_MEMORY_UTILIZATION`, and
-`HF_CACHE_VOLUME` variables.
+location with the `LOCAL_MODELS_*` and
+`LOCAL_EMBED_GPU_MEMORY_UTILIZATION` variables. Hugging Face files are stored
+in `./cache/huggingface`.
 
 ## Observability
 
@@ -205,8 +324,9 @@ the stack.
    selected NIM profile) are visible.
 
 Use `docker compose ... logs -f`, `ps`, and `down` for normal lifecycle work.
-Named data/model caches survive `down`; use `down -v` only when a clean cache
-and database are intentionally required.
+The bind-mounted caches survive `down` and are visible directly under
+`./cache/`; remove those directories manually only when a clean cache or
+database is intentionally required.
 
 ## Other helpers
 

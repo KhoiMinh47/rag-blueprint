@@ -55,6 +55,7 @@ class JobStatusResponse(RichModel):
     result_rows: int | None = None
     result_data: list[dict[str, Any]] | None = None
     error: str | None = None
+    pipeline_diagnostics: dict[str, Any] | None = None
 
 
 class SidecarUploadResponse(RichModel):
@@ -122,6 +123,7 @@ class DocumentStatusResponse(RichModel):
     result_rows: int | None = None
     result_data: list[dict[str, Any]] | None = None
     error: str | None = None
+    pipeline_diagnostics: dict[str, Any] | None = None
 
 
 class JobDocumentsPage(RichModel):

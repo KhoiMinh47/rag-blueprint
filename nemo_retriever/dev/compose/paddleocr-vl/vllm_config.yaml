@@ -1,0 +1,3 @@
+# One page per request; both Paddle containers share the single local GPU.
+gpu-memory-utilization: 0.45
+max-num-seqs: 1

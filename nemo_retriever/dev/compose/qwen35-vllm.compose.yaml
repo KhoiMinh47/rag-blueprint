@@ -1,0 +1,85 @@
+# Local Qwen3.5 vLLM sidecar for the single-GPU development host.
+#
+# Use together with service-mode.compose.yaml.  The service is profile-gated
+# so it never starts implicitly with the existing NIM stack.  The internal
+# alias keeps the current Option 2 endpoint (vintern-ocr) usable while the
+# actual model is Qwen3.5.
+services:
+  qwen35-nvfp4:
+    image: ${QWEN35_VLLM_IMAGE:-nemo-retriever-service-gpu:dev}
+    profiles: [qwen35-nvfp4]
+    runtime: nvidia
+    user: nemo
+    shm_size: ${QWEN35_VLLM_SHM_SIZE:-8gb}
+    restart: "no"
+    entrypoint: []
+    command:
+      - python
+      - /opt/vintern_vllm/vllm_entrypoint.py
+      - serve
+      - "${OPTION6_VLLM_MODEL_PATH:-/models/huggingface/models--AxionML--Qwen3.5-2B-NVFP4/snapshots/6f2ad4febe92be529de499b08f0020f5ff06bf25}"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --served-model-name
+      - "${OPTION6_VLLM_SERVED_MODEL:-AxionML/Qwen3.5-2B-NVFP4}"
+      - Vintern-1B-v3.5
+      - --quantization
+      - "${OPTION6_VLLM_QUANTIZATION:-modelopt_fp4}"
+      - --dtype
+      - auto
+      - --tensor-parallel-size
+      - "1"
+      - --max-model-len
+      - "${OPTION6_VLLM_MAX_MODEL_LEN:-32768}"
+      - --max-num-seqs
+      - "${OPTION6_VLLM_MAX_NUM_SEQS:-8}"
+      - --max-num-batched-tokens
+      - "${OPTION6_VLLM_MAX_NUM_BATCHED_TOKENS:-4096}"
+      - --gpu-memory-utilization
+      # 0.20 x 48,935 MiB = 9,787 MiB (~9.6 GiB), keeping vLLM below 10 GB.
+      - "${OPTION6_VLLM_GPU_MEMORY_UTILIZATION:-0.20}"
+      # Keep CUDA Graph/torch.compile enabled for decode throughput.  The
+      # capture ceiling is bounded by max_num_seqs*2, so this does not open an
+      # unbounded graph-memory path on the 10 GB vLLM budget.
+      - --max-cudagraph-capture-size
+      - "${OPTION6_VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE:-16}"
+      - --limit-mm-per-prompt
+      - '{"image":1}'
+    ports: ["${QWEN35_VLLM_HOST_PORT:-8015}:8000"]
+    environment:
+      CUDA_VISIBLE_DEVICES: "${QWEN35_VLLM_CUDA_VISIBLE_DEVICES:-0}"
+      HOME: /workspace
+      HF_HOME: /models/huggingface
+      HUGGINGFACE_HUB_CACHE: /models/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      VLLM_CACHE_ROOT: /cache/vllm
+      XDG_CACHE_HOME: /cache
+      TORCHINDUCTOR_CACHE_DIR: /cache/torchinductor
+      VLLM_LOGGING_LEVEL: ${QWEN35_VLLM_LOGGING_LEVEL:-INFO}
+    volumes:
+      - ../../../cache/huggingface:/models/huggingface:ro
+      - ../../../cache/qwen35-vllm:/cache:rw
+      # FlashInfer resolves its JIT cache under $HOME/.cache. Persist the
+      # Blackwell/SM120 NVFP4 kernels across container recreates.
+      - ../../../cache/qwen35-vllm:/workspace/.cache:rw
+      - ../../../tools/vintern_vllm:/opt/vintern_vllm:ro
+    networks:
+      default:
+        aliases:
+          - vintern-ocr
+    healthcheck:
+      test: [CMD-SHELL, "python -c \"import socket; s=socket.create_connection(('127.0.0.1', 8000), 2); s.close()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 180s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${QWEN35_VLLM_GPU_ID:-0}"]
+              capabilities: [gpu]

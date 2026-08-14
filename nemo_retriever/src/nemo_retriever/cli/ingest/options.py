@@ -218,14 +218,32 @@ PageElementsInvokeUrlOption = Annotated[
     str | None,
     typer.Option("--page-elements-invoke-url", help="Page-elements NIM endpoint URL."),
 ]
-OcrInvokeUrlOption = Annotated[str | None, typer.Option("--ocr-invoke-url", help="OCR NIM endpoint URL.")]
+OcrInvokeUrlOption = Annotated[
+    str | None,
+    typer.Option("--ocr-invoke-url", help="Primary Nemotron OCR v2 NIM endpoint URL."),
+]
 OcrVersionOption = Annotated[
     OcrVersionValue | None,
-    typer.Option("--ocr-version", help="OCR engine version for extraction."),
+    typer.Option("--ocr-version", help="Local integrated OCR engine version."),
+]
+LineDetectorInvokeUrlOption = Annotated[
+    str | None,
+    typer.Option("--line-detector-invoke-url", help="PP-OCRv6 line detector endpoint URL."),
+]
+OcrRecognizerInvokeUrlOption = Annotated[
+    str | None,
+    typer.Option("--ocr-recognizer-invoke-url", help="PP-OCRv6 recognizer endpoint URL."),
+]
+VietnameseOcrInvokeUrlOption = Annotated[
+    str | None,
+    typer.Option(
+        "--vietnamese-ocr-invoke-url",
+        help="Option 3 Vietnamese recognizer endpoint URL (VietOCR by default).",
+    ),
 ]
 OcrLangOption = Annotated[
     OcrLangValue | None,
-    typer.Option("--ocr-lang", help="OCR v2 language selector for local extraction."),
+    typer.Option("--ocr-lang", help="OCR language selector for local extraction."),
 ]
 TableStructureInvokeUrlOption = Annotated[
     str | None,

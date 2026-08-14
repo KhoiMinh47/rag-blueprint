@@ -7,15 +7,17 @@
  */
 
 const NAV_ITEMS = [
-  { id: 'overview', label: 'Overview', icon: '◉' },
-  { id: 'jobs',     label: 'Jobs', icon: '▶' },
-  { id: 'vdb',      label: 'VDB Explorer', icon: '⬡' },
+  { id: 'overview', label: 'Tổng quan', icon: '◉' },
+  { id: 'jobs',     label: 'Job', icon: '▶' },
+  { id: 'ingest',   label: 'Debug ingest', icon: '⇧' },
+  { id: 'vdb',      label: 'Khám phá VDB', icon: '⬡' },
 ];
 
 const VIEW_TITLES = {
-  overview: 'Cluster Overview',
-  jobs: 'Jobs',
-  vdb: 'VDB Explorer',
+  overview: 'Tổng quan cụm dịch vụ',
+  jobs: 'Danh sách job',
+  ingest: 'Debug ingest',
+  vdb: 'Khám phá VDB',
 };
 
 function Layout({ view, onNavigate, breadcrumb, children }) {
@@ -26,7 +28,7 @@ function Layout({ view, onNavigate, breadcrumb, children }) {
           src: '/v1/dashboard/static/nvidia-logo.svg',
           alt: 'NVIDIA',
         }),
-        React.createElement('span', null, 'Dashboard'),
+        React.createElement('span', null, 'Bảng điều khiển'),
       ),
       React.createElement('nav', { className: 'sidebar-nav' },
         NAV_ITEMS.map(item =>

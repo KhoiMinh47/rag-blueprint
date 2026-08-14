@@ -28,6 +28,8 @@ from nemo_retriever.common.ray_resource_hueristics import (
 )
 
 import logging
+import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -116,10 +118,27 @@ class InprocessExecutor(AbstractExecutor):
 
         resolved_graph = resolve_graph(self.graph, _rrh.gather_local_resources())
         nodes = self._linearize(resolved_graph)
+        option2_timing = any(node.name == "Option2LanguageRoutedOCR" for node in nodes) or (
+            os.environ.get("NEMO_RETRIEVER_OPTION2_TIMING", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        construction_started = time.perf_counter() if option2_timing else 0.0
         operators = []
         for node in nodes:
             op = node.operator_class(**node.operator_kwargs)
             operators.append((node.name, op))
+        if option2_timing:
+            logger.info(
+                "Option 2 operator construction: stages=%s elapsed=%.4fs",
+                [name for name, _op in operators],
+                time.perf_counter() - construction_started,
+            )
+            print(
+                "Option 2 operator construction: "
+                f"stages={[name for name, _op in operators]} "
+                f"elapsed={time.perf_counter() - construction_started:.4f}s",
+                flush=True,
+            )
 
         try:
             from tqdm import tqdm
@@ -130,10 +149,38 @@ class InprocessExecutor(AbstractExecutor):
             pbar = tqdm(operators, desc="Pipeline stages", unit="stage")
             for name, op in pbar:
                 pbar.set_postfix_str(name)
+                started = time.perf_counter() if option2_timing else 0.0
                 df = op.run(df)
+                if option2_timing:
+                    logger.info(
+                        "Option 2 stage timing: node=%s elapsed=%.4fs rows=%d",
+                        name,
+                        time.perf_counter() - started,
+                        len(df) if hasattr(df, "__len__") else -1,
+                    )
+                    print(
+                        "Option 2 stage timing: "
+                        f"node={name} elapsed={time.perf_counter() - started:.4f}s "
+                        f"rows={len(df) if hasattr(df, '__len__') else -1}",
+                        flush=True,
+                    )
         else:
-            for _name, op in operators:
+            for name, op in operators:
+                started = time.perf_counter() if option2_timing else 0.0
                 df = op.run(df)
+                if option2_timing:
+                    logger.info(
+                        "Option 2 stage timing: node=%s elapsed=%.4fs rows=%d",
+                        name,
+                        time.perf_counter() - started,
+                        len(df) if hasattr(df, "__len__") else -1,
+                    )
+                    print(
+                        "Option 2 stage timing: "
+                        f"node={name} elapsed={time.perf_counter() - started:.4f}s "
+                        f"rows={len(df) if hasattr(df, '__len__') else -1}",
+                        flush=True,
+                    )
 
         return df
 

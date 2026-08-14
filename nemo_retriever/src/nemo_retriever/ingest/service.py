@@ -66,6 +66,7 @@ class ServiceIngestExtractOptions:
     use_table_structure: bool | None = None
     table_output_format: str | None = None
     ocr_version: str | None = None
+    ocr_lang: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,11 +185,14 @@ def resolve_service_ingest_request(request: ServiceIngestPlanRequest) -> Service
                 "extract_tables": request.extract.extract_tables,
                 "extract_charts": request.extract.extract_charts,
                 "extract_infographics": request.extract.extract_infographics,
+                "extract_stamps": request.extract.extract_stamps,
                 "extract_page_as_image": request.extract.extract_page_as_image,
                 "use_page_elements": request.extract.use_page_elements,
                 "use_table_structure": request.extract.use_table_structure,
                 "table_output_format": request.extract.table_output_format,
                 "ocr_version": request.extract.ocr_version,
+                "ocr_lang": request.extract.ocr_lang,
+                "stamp_detection_min_score": request.extract.stamp_detection_min_score,
             }.items()
             if value is not None
         }
@@ -342,6 +346,7 @@ def _service_extraction_mode(input_type: str) -> str:
         "doc": "pdf",
         "txt": "text",
         "html": "html",
+        "spreadsheet": "spreadsheet",
         "audio": "audio",
         "video": "auto",
     }.get(input_type, "auto")
@@ -418,6 +423,8 @@ def _split_config_for_input_type(
         return {"text": chunk_dict}
     if input_type == "html":
         return {"html": chunk_dict}
+    if input_type == "spreadsheet":
+        return {"spreadsheet": chunk_dict}
     if input_type == "image":
         return {"image": chunk_dict}
     if input_type == "audio":
@@ -439,6 +446,8 @@ def _split_config_for_auto_documents(
         split_config["text"] = dict(chunk_dict)
     if "html" in input_types:
         split_config["html"] = dict(chunk_dict)
+    if "spreadsheet" in input_types:
+        split_config["spreadsheet"] = dict(chunk_dict)
     if "image" in input_types:
         split_config["image"] = dict(chunk_dict)
     if "audio" in input_types:
